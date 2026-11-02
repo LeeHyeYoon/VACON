@@ -1,10 +1,14 @@
 from datetime import timedelta
 
+import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 from services import risk, summary
 from services.models import today
+from services.version_projects import aggregate_version_logs, project_summary
+from services.internal_projects import dashboard as internal_dashboard, is_internal_version, is_legacy_sheet_version
+from data import db
 from views.common import LEVEL_COLORS, fmt_date, header, risk_table, show_df
 
 
@@ -35,6 +39,46 @@ def render(team, rules):
     if m["insufficient_count"]:
         st.warning(f"담당자·중요도 미입력 등으로 위험도를 계산하지 못한 업무가 {m['insufficient_count']}건 있습니다. "
                    "이 업무는 '안전'으로 간주하지 않습니다.")
+
+    projects = [p for p in db.list_version_projects() if is_legacy_sheet_version(p["version"])]
+    if projects:
+        st.subheader("버전별 동적검증 진행 현황")
+        version_rows = []
+        at_risk = []
+        logs_by_version = aggregate_version_logs(team.logs.to_dict("records") if len(team.logs) else [])
+        for project in projects:
+            logs = logs_by_version.get(project["version"].strip().casefold(), {})
+            phases = project_summary(team, project, t, {"spec": logs.get("spec_done_req", 0),
+                                                         "verify": logs.get("verify_done_func", 0)})
+            spec, verify = phases["spec"], phases["verify"]
+            risks = [phase for phase in (spec, verify) if phase["risk"] == "지연 위험"]
+            if risks:
+                at_risk.append(f"{project['version']} ({'·'.join('사양서' if x is spec else '검증' for x in risks)})")
+            version_rows.append({"버전": project["version"], "상태": project["status"],
+                "사양서": f"{spec['done']}/{spec['total']} ({spec['progress']:.0%}) · 하루 {spec['daily'] if spec['daily'] is not None else '확인 필요'}개",
+                "동적검증": f"{verify['done']}/{verify['total']} ({verify['progress']:.0%}) · 하루 {verify['daily'] if verify['daily'] is not None else '확인 필요'}개",
+                "사양서 마감": spec["due"] or "미설정", "검증 마감": verify["due"] or "미설정"})
+        st.dataframe(pd.DataFrame(version_rows), use_container_width=True, hide_index=True)
+        if at_risk:
+            st.warning("마감 위험 버전: " + ", ".join(at_risk) + " · 담당자/휴가/처리 가능량을 확인하세요.")
+    st.page_link(VERSION_PAGE, label="버전별 일정 및 변경 이력 관리 →")
+    internal = [p for p in db.list_version_projects() if is_internal_version(p["version"])]
+    if internal:
+        st.subheader("내부 버전 업무 진척 현황 · T0080 이상")
+        rows = []
+        for project in internal:
+            spec = internal_dashboard(project, "spec", db.list_version_workloads(project["id"], "spec"),
+                                      db.list_version_worklogs(project["id"], "spec"), t)
+            verify = internal_dashboard(project, "verify", db.list_version_workloads(project["id"], "verify"),
+                                        db.list_version_worklogs(project["id"], "verify"), t)
+            rows.append({"버전": project["version"],
+                "사양서 일감": f"{spec['totals']['completed_tasks']}/{spec['totals']['total_tasks']} ({spec['totals']['progress']:.0%})",
+                "요구사양서 마감": f"{spec['remaining_days']}일" if spec["remaining_days"] is not None else "미설정",
+                "검증 함수": f"{verify['totals']['completed_functions']}/{verify['totals']['total_functions']} ({verify['totals']['function_progress']:.0%})",
+                "검증 요구사양서": f"{verify['totals']['completed_requirements']}/{verify['totals']['total_requirements']} ({verify['totals']['requirement_progress']:.0%})",
+                "검증 마감": f"{verify['remaining_days']}일" if verify["remaining_days"] is not None else "미설정"})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.page_link(INTERNAL_WORK_PAGE, label="내부 버전 물량·업무 기록·배정 추천 →")
 
     st.subheader("날짜별 팀 가용 인원")
     daily = risk.daily_summary(team, t, t + timedelta(days=rules["horizon_days"]), rules)

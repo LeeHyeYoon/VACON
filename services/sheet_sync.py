@@ -8,10 +8,10 @@ import io
 import re
 import urllib.error
 import urllib.request
-from datetime import date
+from datetime import date, timedelta
 
 from .mail_digest import parse_date
-from .models import UNIT_SKILL, TeamData, isnull, required_skills
+from .models import UNIT_SKILL, TeamData, isnull, required_skills, today
 
 
 class SheetError(Exception):
@@ -80,6 +80,22 @@ def read_table(text: str, header_row: int = 1) -> tuple[list[str], list[dict]]:
     return headers, recs
 
 
+def guess_csv_header_row(rows: list[list[str]], max_rows: int = 30) -> int | None:
+    """Suggest a likely title row, preferring recognized column labels; otherwise abstain on ties."""
+    scores = [(sum(bool(str(cell).strip()) for cell in row), index)
+              for index, row in enumerate(rows[:max_rows], start=1)]
+    if not scores:
+        return None
+    first = [str(cell).strip().casefold() for cell in rows[0] if str(cell).strip()]
+    header_terms = ("이름", "업무", "담당", "날짜", "시작", "종료", "버전", "상태", "진행", "마감",
+                    "name", "task", "owner", "date", "start", "end", "version", "status", "progress", "due")
+    if len(first) >= 2 and len(set(first)) == len(first) and any(term in cell for cell in first for term in header_terms):
+        return 1
+    best = max(score for score, _ in scores)
+    candidates = [index for score, index in scores if score == best and score >= 2]
+    return candidates[0] if len(candidates) == 1 else None
+
+
 # ---------- 값 해석 (해석 불가면 ValueError → 경고로 보고, 추측하지 않음) ----------
 def parse_progress(v) -> int | None:
     s = str(v or "").strip()
@@ -110,22 +126,73 @@ def parse_status(v) -> str | None:
     raise ValueError(f"상태 '{v}' 해석 불가")
 
 
-def parse_sheet_date(v) -> date | None:
-    s = str(v or "").strip()
-    if not s:
+_WEEKDAY_RE = re.compile(r"\(\s*[월화수목금토일]\s*\)|[월화수목금토일]요일|(?<![A-Za-z])(mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?(?![A-Za-z])", re.I)
+_TIME_RE = re.compile(r"(오전|오후|am|pm)?\s*\d{1,2}\s*:\s*\d{2}(\s*:\s*\d{2})?\s*(am|pm)?", re.I)
+
+
+def _mk(y, m, d):
+    try:
+        return date(y, m, d)
+    except ValueError:
         return None
-    d = parse_date(s)
-    if d is None:
-        m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", s)
-        if m:  # 구글 시트 영문 로캘 내보내기(M/D/YYYY). 월이 12 초과면 D/M/YYYY로 해석
-            a, b, y = int(m[1]), int(m[2]), int(m[3])
-            try:
-                d = date(y, a, b) if a <= 12 else date(y, b, a)
-            except ValueError:
-                d = None
-    if d is None:
-        raise ValueError(f"날짜 '{s}' 해석 불가(YYYY-MM-DD 형식 권장)")
-    return d
+
+
+def _infer_year(m: int, d: int, ref: date, mode: str, year: int | None) -> date | None:
+    """연도가 없는 날짜의 연도 결정. year 지정 시 그 해. mode='past'(업무 로그): 기준일+7일 이내의 가장 최근 해,
+    mode='nearest'(마감일 등): 기준일에 가장 가까운 해."""
+    if year:
+        return _mk(year, m, d)
+    cands = [c for c in (_mk(ref.year + k, m, d) for k in (-1, 0, 1)) if c]
+    if not cands:
+        return None
+    if mode == "past":
+        ok = [c for c in cands if c <= ref + timedelta(days=7)]
+        return max(ok) if ok else min(cands)
+    return min(cands, key=lambda c: abs((c - ref).days))
+
+
+def parse_sheet_date_ex(v, ref: date | None = None, mode: str = "nearest", year: int | None = None) -> tuple[date | None, bool]:
+    """시트 셀 → (날짜, 연도를 추정했는지). 빈 칸은 (None, False), 해석 불가는 ValueError.
+    지원: 2026-10-19 / 2026. 10. 19. / 2026/10/19 / 2026년 10월 19일 / 26.10.19 / 20261019 / 10/19/2026 /
+    19.10.2026 / 10/19 / 10월 19일 / 요일·시간 포함(10/19(월), 2026-10-19 09:30) / 엑셀 일련번호."""
+    raw = str(v or "").strip()
+    if not raw:
+        return None, False
+    ref = ref or today()
+    t = re.sub(r"T\d.*$", "", raw)
+    t = _TIME_RE.sub(" ", _WEEKDAY_RE.sub(" ", t)).strip(" ,~·")
+    if re.fullmatch(r"\d{5}(\.\d+)?", t) and 20000 <= float(t) <= 80000:  # 엑셀/시트 일련번호
+        return date(1899, 12, 30) + timedelta(days=int(float(t))), False
+    m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})", t)
+    if m and (d := _mk(int(m[1]), int(m[2]), int(m[3]))):
+        return d, False
+    m = re.search(r"(?<!\d)(\d{4})\s*(?:[-./]|년)\s*(\d{1,2})\s*(?:[-./]|월)\s*(\d{1,2})\s*일?(?!\d)", t)
+    if m and (d := _mk(int(m[1]), int(m[2]), int(m[3]))):
+        return d, False
+    m = re.search(r"(?<!\d)(\d{1,2})\s*([-./])\s*(\d{1,2})\s*\2\s*(\d{4})(?!\d)", t)  # 월/일/연 또는 일.월.연
+    if m:
+        a, sep, b, y = int(m[1]), m[2], int(m[3]), int(m[4])
+        for d in ([_mk(y, a, b), _mk(y, b, a)] if sep == "/" else [_mk(y, b, a), _mk(y, a, b)]):
+            if d:
+                return d, False
+    m = re.search(r"(?<!\d)(\d{2})\s*([-./])\s*(\d{1,2})\s*\2\s*(\d{1,2})(?!\d)", t)  # 두 자리 연도
+    if m:
+        x, sep, y2, z = int(m[1]), m[2], int(m[3]), int(m[4])
+        order = [(2000 + x, y2, z)] if (x > 12 or sep != "/") else []
+        order += [(2000 + z, x, y2)] if sep == "/" else []          # 10/19/26 → 월/일/연
+        order += [(2000 + x, y2, z), (2000 + z, x, y2)]
+        for yy, mm, dd in order:
+            if d := _mk(yy, mm, dd):
+                return d, False
+    m = re.search(r"(?<!\d)(\d{1,2})\s*월\s*(\d{1,2})\s*일?(?!\d)", t) or \
+        re.fullmatch(r"(\d{1,2})\s*[-./]\s*(\d{1,2})\.?", t)                      # 연도 없는 월/일
+    if m and (d := _infer_year(int(m[1]), int(m[2]), ref, mode, year)):
+        return d, True
+    raise ValueError(f"날짜 '{raw}' 해석 불가")
+
+
+def parse_sheet_date(v, ref: date | None = None, mode: str = "nearest", year: int | None = None) -> date | None:
+    return parse_sheet_date_ex(v, ref, mode, year)[0]
 
 
 def match_owner(cell: str, team: TeamData) -> tuple[int | None, str]:
@@ -180,7 +247,7 @@ def plan_sync(team: TeamData, records: list[dict], cfg: dict) -> dict:
             if v is not None:
                 vals[field] = v
 
-        grab("due", parse_sheet_date)
+        grab("due", lambda v: parse_sheet_date(v, today(), "nearest"))
         if role == "tasks":
             grab("status", parse_status)
             grab("progress", parse_progress)

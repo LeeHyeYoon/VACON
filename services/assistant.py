@@ -182,8 +182,11 @@ def _handover(q, team, today, rules) -> Answer:
 def _throughput(q, team, today, rules) -> Answer:
     if len(team.logs) == 0:
         return Answer("연동된 업무 로그가 없어 처리량을 알 수 없습니다. '데이터 관리 > 시트 연동'에서 로그 탭을 연결해 주세요.", supported=False)
-    days, label = (today.weekday() + 1, "이번 주") if re.search(r"이번\s*주", q) else (28, "최근 4주")
-    df = throughput_table(team, today, days, rules)
+    if re.search(r"이번\s*주", q):
+        start, label = today - timedelta(days=today.weekday()), "이번 주"
+    else:
+        start, label = today - timedelta(days=27), "최근 4주"
+    df = throughput_table(team, start, today, rules)
     if df.empty:
         return Answer("단위 테스트 인원('단위테스트' 역량 보유자)이 없어 집계할 수 없습니다.", supported=False)
     tables = [df[df["업무"] == n].dropna(axis=1, how="all").drop(columns="업무") for n in TRACKS.values()]

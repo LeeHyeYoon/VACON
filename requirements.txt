@@ -2,5 +2,5 @@ streamlit>=1.40
 pandas>=2.0
 plotly>=5.20
 pytest>=8.0
-# 선택: LLM 연동(ANTHROPIC_API_KEY 설정 시에만 사용)
+# 선택: AI Agent 및 LLM 문장화(ANTHROPIC_API_KEY 설정 시 사용)
 # anthropic>=0.40

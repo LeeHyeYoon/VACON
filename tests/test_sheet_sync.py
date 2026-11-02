@@ -5,6 +5,7 @@ from unittest import mock
 
 from data import db
 from services import sheet_sync as ss
+from services import worklog as wl
 from services.models import make_team
 
 SID = "1SU9VQEu_GOOvtd4CZHSPLXJWURkQLUQzPi5XRLBLHSs"
@@ -50,6 +51,21 @@ class HelperTests(unittest.TestCase):
         h, _ = ss.read_table("a,a,\n1,2,3\n")
         self.assertEqual(h, ["a", "a #2", "(열 3)"])
         with self.assertRaises(ss.SheetError): ss.read_table("a\n", header_row=5)
+
+    def test_header_row_guess_and_ambiguity(self):
+        self.assertEqual(ss.guess_csv_header_row([["업무명", "담당자", "마감일"], ["A", "김", "10/1"]]), 1)
+        self.assertEqual(ss.guess_csv_header_row([["설명"], ["이름", "시작일", "종료일"], ["김", "10/1", ""]]), 2)
+        self.assertIsNone(ss.guess_csv_header_row([["a", "b"], ["c", "d"]]))
+        self.assertIsNone(ss.guess_csv_header_row([]))
+
+    def test_func_column_guess_requires_unambiguous_func_header(self):
+        self.assertEqual(wl.guess_func_column(["날짜", "담당자", "완료 Func"]), "C")
+        self.assertIsNone(wl.guess_func_column(["날짜", "Func A", "Func B"]))
+
+    def test_subsystem_column_guess_requires_unambiguous_header(self):
+        self.assertEqual(wl.guess_subsystem_column(["날짜", "서브시스템", "담당자"]), "B")
+        self.assertEqual(wl.guess_subsystem_column(["Subsystem", "date"]), "A")
+        self.assertIsNone(wl.guess_subsystem_column(["SubSystem A", "Subsystem B"]))
 
     def test_parsers(self):
         self.assertEqual(ss.parse_progress("60%"), 60); self.assertEqual(ss.parse_progress("0.6"), 60)

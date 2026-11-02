@@ -23,9 +23,9 @@ def skills():
     return s
 
 
-def log(mid, d, tc=0, req=0, issue=0, track="dynamic", ver="v1"):
+def log(mid, d, tc=0, req=0, issue=0, track="dynamic", ver="v1", subsystem=""):
     return {"id": None, "source": "T", "track": track, "date": d, "member_id": mid, "version": ver,
-            "category": "c", "req": req, "tc": tc, "issue": issue}
+            "subsystem": subsystem, "category": "c", "req": req, "tc": tc, "func": 0, "issue": issue}
 
 
 def leave(mid, s, e, typ="연차", i=1):
@@ -100,6 +100,28 @@ class LetterAndParseTests(unittest.TestCase):
 
 
 class StatsTests(unittest.TestCase):
+    def test_version_filter_keeps_worklog_aggregates_separate(self):
+        t = team([log(3, D(0), tc=10, ver="T0070"), log(3, D(1), tc=90, ver="T0080")])
+        one = wl.member_stats(t, 3, "dynamic", D(0), D(4), version="T0070")
+        self.assertEqual(one["sum"]["tc"], 10)
+        table = wl.throughput_table(t, D(0), D(4), version="T0080")
+        row = table[(table["팀원"] == "김재강") & (table["업무"] == "동적 검증")].iloc[0]
+        self.assertEqual(row["실행 TC 합계"], 90)
+
+    def test_subsystem_filter_keeps_worklog_aggregates_separate(self):
+        t = team([log(3, D(0), tc=10, ver="T0070", subsystem="Audio"),
+                  log(3, D(1), tc=90, ver="T0070", subsystem="Display")])
+        table = wl.throughput_table(t, D(0), D(4), version="T0070", subsystem="Audio")
+        row = table[(table["팀원"] == "김재강") & (table["업무"] == "동적 검증")].iloc[0]
+        self.assertEqual(row["실행 TC 합계"], 10)
+
+    def test_unassigned_subsystem_filter_includes_legacy_nan_values(self):
+        t = team([log(3, D(0), tc=12, ver="T0070")])
+        t.logs.loc[t.logs.index[0], "subsystem"] = float("nan")
+        table = wl.throughput_table(t, D(0), D(4), version="T0070", subsystem="")
+        row = table[(table["팀원"] == "김재강") & (table["업무"] == "동적 검증")].iloc[0]
+        self.assertEqual(row["실행 TC 합계"], 12)
+
     def test_avg_excludes_weekend_and_leave_days(self):
         logs = weekday_logs(3, D(0), D(4), 20)                 # 월~금 20TC
         t = team(logs, [leave(3, D(3), D(4))])                 # 목·금 휴가
@@ -111,12 +133,12 @@ class StatsTests(unittest.TestCase):
     def test_no_logs_is_not_zero(self):
         st = wl.member_stats(team(), 3, "dynamic", D(0), D(4))
         self.assertFalse(st["has_logs"])
-        tbl = wl.throughput_table(team(), TODAY)
+        tbl = wl.throughput_table(team(), D(0), TODAY)
         self.assertTrue((tbl["최근 기록일"] == "기록 없음").all())
 
     def test_throughput_table_only_unit_pool(self):
         t = team(weekday_logs(6, D(0), D(4), 99))              # 단위 테스트 인원 아님
-        self.assertNotIn("타팀원", set(wl.throughput_table(t, TODAY)["팀원"]))
+        self.assertNotIn("타팀원", set(wl.throughput_table(t, D(0), TODAY)["팀원"]))
 
 
 class ImpactTests(unittest.TestCase):
@@ -136,6 +158,15 @@ class ImpactTests(unittest.TestCase):
         self.assertAlmostEqual(sum(x["분담 필요량"] for x in it["rows"]), it["gap"], delta=1)
         self.assertGreater(rows["김재강"]["분담 필요량"], rows["황지원"]["분담 필요량"])   # 처리량 큰 사람이 더 많이 분담
         self.assertEqual(rows["김재강"]["평소 대비"], rows["황지원"]["평소 대비"])         # 용량 비례라 증가율 동일
+
+    def test_leave_impact_uses_selected_version_logs(self):
+        logs = [log(2, D(0), tc=10, ver="T0070"), log(2, D(0), tc=100, ver="T0080"),
+                log(3, D(0), tc=20, ver="T0070"), log(3, D(0), tc=200, ver="T0080")]
+        t = team(logs, [leave(2, self.start, self.end)])
+        impact = wl.leave_impact(t, 2, self.start, self.end, TODAY, base_start=D(0), base_end=D(4), version="T0070")
+        tc = next(i for i in impact["items"] if i["metric"] == "tc")
+        self.assertEqual(tc["avg"], 2)
+        self.assertEqual(tc["rows"][0]["현재 일평균"], 4)
 
     def test_absent_colleague_excluded_and_none_available(self):
         t = team(self.logs, [leave(2, self.start, self.end), leave(3, self.start, self.end, i=2)])
@@ -214,12 +245,14 @@ class DbAndIntegrationTests(unittest.TestCase):
         self.assertGreater(n_sample, 0)
         ents = wl.parse_logs(CSV_DYN, CFG_DYN, db.load_team_data(self.path))["entries"]
         # CSV의 이름이 샘플 팀원 이름과 달라 0건일 수 있으므로 직접 엔트리 구성
-        ents = [{"track": "dynamic", "date": date(2026, 10, 19), "member_id": 4, "version": "v1", "category": "c", "req": 3, "tc": 20, "row": 2}]
+        ents = [{"track": "dynamic", "date": date(2026, 10, 19), "member_id": 4, "version": "v1", "subsystem": "Audio", "category": "c", "req": 3, "tc": 20, "func": 9, "row": 2}]
         self.assertEqual(db.replace_logs("시트A", ents, self.path), {"removed": 0, "added": 1})
         self.assertEqual(db.replace_logs("시트A", ents + ents, self.path), {"removed": 1, "added": 2})   # 교체(누적 아님)
         t = db.load_team_data(self.path)
         self.assertEqual(int((t.logs["source"] == "시트A").sum()), 2)
         self.assertEqual(len(t.logs), n_sample + 2)
+        self.assertEqual(int(t.logs[t.logs["source"] == "시트A"]["func"].sum()), 18)
+        self.assertEqual(set(t.logs[t.logs["source"] == "시트A"]["subsystem"]), {"Audio"})
         db.delete_logs("샘플", self.path)
         self.assertEqual(set(db.load_team_data(self.path).logs["source"]), {"시트A"})
         db.delete_member(4, self.path)
@@ -237,8 +270,23 @@ class DbAndIntegrationTests(unittest.TestCase):
     def test_default_sync_presets_use_user_columns(self):
         db.init_db(self.path)
         src = {s["role"]: s for s in db.load_sync_config(self.path)["sources"]}
-        self.assertEqual(src["log_dynamic"]["columns"], {"date": "A", "member": "B", "version": "C", "category": "D", "req": "I", "tc": "O"})
-        self.assertEqual(src["log_req"]["columns"], {"date": "A", "member": "B", "version": "C", "category": "D", "issue": "G"})
+        self.assertEqual(src["log_dynamic"]["columns"], {"date": "A", "member": "B", "version": "C", "subsystem": "", "category": "D", "req": "I", "tc": "O", "func": "L"})
+        self.assertEqual(src["log_req"]["columns"], {"date": "A", "member": "B", "version": "C", "subsystem": "", "category": "D", "issue": "G"})
+
+    def test_old_work_log_schema_migrates_subsystem_without_losing_rows(self):
+        c = sqlite3.connect(self.path)
+        c.executescript("CREATE TABLE members(id INTEGER PRIMARY KEY, name TEXT NOT NULL, role TEXT, workload INTEGER, contact TEXT, mbti TEXT);"
+                        "INSERT INTO members(id,name) VALUES(1,'기존');"
+                        "CREATE TABLE work_logs(id INTEGER PRIMARY KEY, source TEXT NOT NULL, track TEXT NOT NULL, log_date TEXT NOT NULL, "
+                        "member_id INTEGER NOT NULL, version TEXT DEFAULT '', category TEXT DEFAULT '', req_done REAL DEFAULT 0, "
+                        "tc_done REAL DEFAULT 0, issue_done REAL DEFAULT 0, src_row INTEGER);"
+                        "INSERT INTO work_logs(id,source,track,log_date,member_id,version,category,req_done) "
+                        "VALUES(1,'시트','dynamic','2026-10-19',1,'T0070','검증',3);")
+        c.commit(); c.close()
+        db.init_db(self.path, seed=False)
+        data = db.load_team_data(self.path)
+        self.assertEqual(len(data.logs), 1)
+        self.assertEqual((data.logs.iloc[0]["req"], data.logs.iloc[0]["subsystem"], data.logs.iloc[0]["func"]), (3, "", 0))
 
     def test_sample_meets_unit_rule_and_demo_scenarios(self):
         db.init_db(self.path)

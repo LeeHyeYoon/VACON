@@ -4,7 +4,7 @@ import streamlit as st
 from data import db
 from services import llm
 from services.models import today
-from views import assistant_page, backup_page, calendar_page, dashboard, data_page, handover_page, mail_page, risk_page, worklog_page
+from views import assistant_page, backup_page, calendar_page, dashboard, data_page, handover_page, internal_work_page, mail_page, version_page, worklog_page
 
 st.set_page_config(page_title="VACON · 업무 연속성 비서", page_icon="🗓️", layout="wide")
 st.markdown("""
@@ -25,8 +25,9 @@ db.init_db()
 MENU = [
     ("📊", "대시보드", "dashboard", dashboard),
     ("🗓️", "휴가 캘린더", "calendar", calendar_page),
-    ("⚠️", "위험 분석", "risk", risk_page),
     ("📈", "업무 로그", "worklog", worklog_page),
+    ("🧪", "버전별 동적검증", "versions", version_page),
+    ("🧩", "내부 버전 업무", "internal-work", internal_work_page),
     ("🤝", "대체 담당자", "backup", backup_page),
     ("📝", "인수인계", "handover", handover_page),
     ("📧", "메일 요약", "mail", mail_page),
@@ -48,4 +49,11 @@ with st.sidebar:  # 메뉴 아래에 표시되는 상태 정보
 
 pages = [st.Page(_runner(m), title=t, icon=i, url_path=u, default=(n == 0))
          for n, (i, t, u, m) in enumerate(MENU)]
+# st.page_link() in dynamic navigation must receive the registered StreamlitPage,
+# not a URL string that is normally used by the multipage file convention.
+page_by_path = {page.url_path: page for page in pages}
+dashboard.VERSION_PAGE = page_by_path["versions"]
+dashboard.INTERNAL_WORK_PAGE = page_by_path["internal-work"]
+version_page.WORKLOG_PAGE = page_by_path["worklog"]
+internal_work_page.WORKLOG_PAGE = page_by_path["worklog"]
 st.navigation(pages, position="sidebar").run()

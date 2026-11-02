@@ -11,7 +11,7 @@ from views.common import show_df
 
 NONE = "(사용 안 함)"
 ROLE_LABEL = {
-    "log_dynamic": "작업 로그 — 동적 검증 (완료 Req / 실행 TC)",
+    "log_dynamic": "작업 로그 — 동적 검증 (완료 Req / 완료 Func / 실행 TC)",
     "log_req": "작업 로그 — 요구사양서 작성 (완료 일감)",
     "tasks": "업무 목록 (업무 생성·갱신)",
     "schedule": "일정 (기존 업무의 마감일만 갱신)",
@@ -24,12 +24,25 @@ def _load_text(url, src, uploaded):
     return ss.fetch_csv(url, src["gid"])
 
 
-def _raw_header(text, header_row):
+def _rows(text):
     import csv, io
-    rows = list(csv.reader(io.StringIO(text)))
+    return list(csv.reader(io.StringIO(text)))
+
+
+def _raw_header(text, header_row):
+    rows = _rows(text)
     if header_row < 1 or header_row > len(rows):
         raise ss.SheetError(f"헤더 행({header_row})이 데이터 범위를 벗어났습니다(총 {len(rows)}행).")
     return [h.strip() for h in rows[header_row - 1]]
+
+
+def _preview_df(text, n=12):
+    """시트 원본 상단 n행을 열 문자(A, B, …)와 함께 보여주기 위한 표."""
+    rows = _rows(text)[:n]
+    width = max((len(r) for r in rows), default=0)
+    df = pd.DataFrame([r + [""] * (width - len(r)) for r in rows], columns=[wl.col_letter(i) for i in range(width)])
+    df.index = range(1, len(df) + 1)
+    return df
 
 
 def render(team, rules):
@@ -51,12 +64,19 @@ def render(team, rules):
     pick = st.selectbox("설정 선택", [*labels, "+ 새 탭 추가"])
     cur = next((s for s in cfg["sources"] if s["label"] == pick), {}) if pick != "+ 새 탭 추가" else {}
     k = pick
-    c = st.columns(4)
+    c = st.columns(3)
     label = c[0].text_input("탭 이름(표시용)", cur.get("label", ""), key=f"lb_{k}", help="예: 2. Dynamic_Verification")
     gid = c[1].text_input("탭 gid", str(cur.get("gid", "")), key=f"gid_{k}", help="시트에서 해당 탭을 열었을 때 주소 끝 '#gid=' 뒤 숫자")
     roles = list(ROLE_LABEL)
     role = c[2].selectbox("역할", roles, index=roles.index(cur.get("role", "log_dynamic")), format_func=ROLE_LABEL.get, key=f"role_{k}")
-    header_row = c[3].number_input("헤더(제목) 행 번호", 1, 50, int(cur.get("header_row", 1)), key=f"hr_{k}")
+    st.caption("헤더 행은 파일에서 열 이름을 찾기 위해 쓰는 설정입니다. 보통 첫 행에 열 이름이 있으므로 자동으로 읽습니다. 위에 설명이나 빈 줄이 있을 때만 조정하세요.")
+    manual_header = st.checkbox("파일 앞부분에 설명/빈 줄이 있어 헤더 행을 직접 지정", value=False,
+                                key=f"manual_hr_{k}", help="예: 1행은 제목 설명, 2행에 업무명·담당자 같은 열 이름이 있으면 2를 선택합니다.")
+    header_row = (st.number_input("열 이름이 있는 행 번호 (첫 행부터 1)", 1, 50,
+                                  int(cur.get("header_row", 1)), key=f"hr_{k}")
+                  if manual_header else int(cur.get("header_row", 1)))
+    with st.expander("헤더 행이 무엇인가요?"):
+        st.write("헤더 행은 실제 열 제목이 들어 있는 행입니다. 예를 들어 첫 번째 행에 담당자, 시작일, 종료일이 있다면 1을 선택합니다. 제목 위에 설명이나 빈 행이 있다면 실제 열 제목이 있는 행을 선택하세요.")
     is_log = role in wl.LOG_ROLES
     skills = sorted(set(team.skills["skill"])) if len(team.skills) else []
     req = ""
@@ -75,25 +95,66 @@ def render(team, rules):
     if st.button("열 목록 불러오기", key=f"hdr_{k}"):
         try:
             text = _load_text(url or cfg["sheet"], draft, uploaded)
-            if is_log:
-                raw = _raw_header(text, draft["header_row"])
-                st.session_state["sync_headers"] = {"key": k, "raw": raw, "headers": raw, "n": len(text.splitlines()) - draft["header_row"]}
+            rows = _rows(text)
+            guess = wl.guess_header_row(rows, cur.get("headers")) if is_log else ss.guess_csv_header_row(rows)
+            effective_row = int(draft["header_row"]) if manual_header else (guess or 1)
+            draft["header_row"] = effective_row
+            if not manual_header and not guess:
+                st.session_state["sync_headers"] = {"key": k, "needs_header": True, "preview": _preview_df(text), "guess": None}
             else:
-                headers, recs = ss.read_table(text, draft["header_row"])
-                st.session_state["sync_headers"] = {"key": k, "headers": headers, "raw": [], "n": len(recs)}
+                if is_log:
+                    raw = _raw_header(text, effective_row)
+                    st.session_state["sync_headers"] = {"key": k, "raw": raw, "headers": raw, "n": len(rows) - effective_row,
+                        "preview": _preview_df(text), "guess": guess, "header_row": effective_row}
+                else:
+                    headers, recs = ss.read_table(text, effective_row)
+                    raw = _raw_header(text, effective_row)
+                    st.session_state["sync_headers"] = {"key": k, "headers": headers, "raw": raw, "n": len(recs),
+                        "preview": _preview_df(text), "guess": guess, "header_row": effective_row}
         except ss.SheetError as e:
             st.error(str(e))
     hdr = st.session_state.get("sync_headers")
-    loaded = bool(hdr and hdr["key"] == k)
-    if loaded:
-        st.success(f"열 {len(hdr['headers'])}개, 데이터 약 {hdr['n']}행을 읽었습니다.")
+    header_uncertain = bool(hdr and hdr["key"] == k and hdr.get("needs_header"))
+    loaded = bool(hdr and hdr["key"] == k and not header_uncertain)
+    if loaded or header_uncertain:
+        if header_uncertain:
+            st.warning("열 제목 행을 자동으로 찾지 못했습니다. 미리보기에서 열 이름이 있는 행을 확인한 뒤 '파일 앞부분에 설명/빈 줄이 있어 헤더 행을 직접 지정'을 켜고 다시 불러오세요.")
+        else:
+            st.success(f"열 {len(hdr['headers'])}개, 데이터 약 {hdr['n']}행을 읽었습니다.")
+        if hdr.get("preview") is not None:
+            st.write("**시트 원본 상단(앱이 실제로 읽은 내용)** — 행 번호는 왼쪽, 열 문자는 위쪽입니다.")
+            show_df_idx(hdr["preview"])
+            st.caption(f"헤더로 사용 중인 행: {hdr.get('header_row', 1)}행. 이 행에서 열 이름을 읽어 아래 매핑 항목을 채웁니다.")
+            raw = hdr.get("raw", [])
+            blank = [i + 1 for i, name in enumerate(raw) if not name.strip()]
+            duplicates = sorted({name for name in raw if name.strip() and raw.count(name) > 1})
+            if blank or duplicates:
+                st.warning("선택한 제목 행에 " + (f"빈 제목 열 {blank}번" if blank else "")
+                           + (" · " if blank and duplicates else "")
+                           + (f"중복 제목 {', '.join(duplicates)}" if duplicates else "")
+                           + "이 있습니다. 실제 제목 행인지 확인하고 필요하면 원본 CSV/시트를 정리하세요.")
 
-    if is_log:
+    if is_log and (loaded or not hdr or hdr.get("key") != k or not hdr.get("needs_header")):
         track = wl.LOG_ROLES[role]
         st.write("**② 열 매핑(열 문자)** — 시트의 열 문자(A, B, …)를 입력합니다. 제목을 불러오면 확인용으로 옆에 표시됩니다.")
         cols, grid = {}, st.columns(3)
         raw = hdr["raw"] if loaded else []
+        guessed_func = wl.guess_func_column(raw) if track == "dynamic" and raw else None
+        guessed_subsystem = wl.guess_subsystem_column(raw) if raw else None
         defaults = {**db.DEFAULT_SYNC["sources"][0 if track == "dynamic" else 1]["columns"], **cur.get("columns", {})}
+        if track == "dynamic" and not defaults.get("func") and guessed_func:
+            defaults["func"] = guessed_func
+            marker_key = f"func_guess_applied_{k}"
+            marker = tuple(raw)
+            if st.session_state.get(marker_key) != marker:
+                st.session_state[f"let_{k}_func"] = guessed_func
+                st.session_state[marker_key] = marker
+        if not defaults.get("subsystem") and guessed_subsystem:
+            marker_key = f"subsystem_guess_applied_{k}"
+            marker = tuple(raw)
+            if st.session_state.get(marker_key) != marker:
+                st.session_state[f"let_{k}_subsystem"] = guessed_subsystem
+                st.session_state[marker_key] = marker
         for i, (f, lab) in enumerate(wl.LOG_FIELDS[track]):
             letter = grid[i % 3].text_input(f"{lab} 열", defaults.get(f, ""), key=f"let_{k}_{f}", max_chars=3).strip().upper()
             if letter:
@@ -101,6 +162,12 @@ def render(team, rules):
                 if raw and wl.valid_letter(letter):
                     idx = wl.col_index(letter)
                     grid[i % 3].caption("→ 시트 제목: " + (raw[idx] if idx < len(raw) and raw[idx] else "(비어 있음)"))
+        if "subsystem" not in cols:
+            st.caption("서브시스템 열은 선택 항목입니다. 매핑하지 않으면 가져온 로그는 ‘서브시스템 미입력’으로 표시됩니다.")
+        o = st.columns(2)
+        fill = o[0].checkbox("병합 셀 대응: 빈 날짜·담당자는 위 행 값 사용", value=bool(cur.get("fill_down")), key=f"fill_{k}",
+                             help="날짜나 담당자 칸이 병합되어 첫 행에만 값이 있는 시트에서 켜세요.")
+        yr = o[1].number_input("연도(날짜에 연도가 없을 때만 사용, 0=자동 추정)", 0, 2100, int(cur.get("year") or 0), key=f"yr_{k}")
         if st.button("이 탭 설정 저장", key=f"save_{k}"):
             if not draft["label"] or not draft["gid"].isdigit():
                 st.error("탭 이름과 숫자 gid를 입력하세요.")
@@ -108,15 +175,17 @@ def render(team, rules):
                 st.error("열 문자는 A, B, …, AA 형식으로 입력하세요.")
             elif "date" not in cols or "member" not in cols or not any(m in cols for m in wl.METRIC_COLS[track]):
                 st.error("날짜·담당자 열과 집계할 숫자 열을 최소 하나 입력하세요.")
+            elif track == "dynamic" and "func" not in cols:
+                st.error("버전별 검증 완료 수에 연결할 '완료 Func' 열을 지정하세요. 헤더를 찾지 못하면 시트에서 Func 열 문자를 확인해 입력합니다.")
             else:
                 snap = ({f: (raw[wl.col_index(c_)] if wl.col_index(c_) < len(raw) else "") for f, c_ in cols.items()} if raw
                         else (cur.get("headers", {}) if cur.get("columns") == cols else {}))
-                new = {**draft, "columns": cols, "headers": snap}
+                new = {**draft, "columns": cols, "headers": snap, "fill_down": fill, "year": int(yr) or None}
                 srcs = [s for s in cfg["sources"] if s["label"] not in (pick, draft["label"])] + [new]
                 db.save_sync_config({**db.load_sync_config(), "sources": srcs})
                 st.success("저장했습니다." + ("" if snap else " (열 제목을 불러온 뒤 저장하면 시트 구조 변경을 감지할 수 있습니다.)"))
                 st.rerun()
-    elif loaded or cur.get("columns"):
+    elif (loaded and not hdr.get("needs_header")) or cur.get("columns"):
         headers = hdr["headers"] if loaded else list(dict.fromkeys(cur.get("columns", {}).values()))
         st.write("**② 열 매핑** — 시트의 어느 열이 VACON의 어떤 항목인지 지정합니다.")
         fields = ss.TASK_FIELDS if role == "tasks" else ss.SCHEDULE_FIELDS
@@ -157,6 +226,9 @@ def render(team, rules):
         try:
             text = _load_text(cfg["sheet"] or url, src, up2)
             if src["role"] in wl.LOG_ROLES:
+                if src["role"] == "log_dynamic" and not src.get("columns", {}).get("func"):
+                    st.error("동적검증 진행률을 계산하려면 '완료 Func' 시트 열을 먼저 매핑하고 설정을 저장하세요.")
+                    return
                 st.session_state["sync_plan"] = {"label": src_label, "kind": "log", "res": wl.parse_logs(text, src, team)}
             else:
                 _, recs = ss.read_table(text, int(src.get("header_row", 1)))
@@ -177,8 +249,18 @@ def render(team, rules):
         _show_task_plan(team, sp["plan"], src_label)
 
 
+def show_df_idx(df):
+    st.dataframe(df)
+
+
 def _show_log_plan(team, sp, src_label):
     res = sp["res"]
+    dg = res.get("diag", {})
+    if dg.get("bad_date_rows") or dg.get("blank_date_rows"):
+        st.error(f"날짜를 읽지 못한 행이 있습니다(날짜 열 {dg['date_col']}). "
+                 + (f"읽지 못한 값 예시: " + ", ".join(f"'{v}'" for v, _ in dg.get("bad_dates", [])[:6]) if dg.get("bad_dates") else ""))
+        if dg.get("header_hint"):
+            st.warning(dg["header_hint"])
     ents = res["entries"]
     cur = int((team.logs["source"] == src_label).sum()) if len(team.logs) else 0
     m = st.columns(4)
@@ -208,12 +290,15 @@ def _show_log_plan(team, sp, src_label):
     has_sample = len(team.logs) and (team.logs["source"] == "샘플").any()
     drop_sample = st.checkbox("샘플(가상) 로그 삭제", value=True, key="drop_sample") if has_sample and src_label != "샘플" else False
     if ents and st.button("✅ 미리보기 내용 반영(이 탭의 기존 기록 교체)", key="log_apply"):
-        r = db.replace_logs(src_label, ents)
-        if drop_sample:
-            db.delete_logs("샘플")
-        st.session_state.pop("sync_plan", None)
-        st.success(f"기존 {r['removed']}건을 {r['added']}건으로 교체했습니다.")
-        st.rerun()
+        try:
+            r = db.replace_logs(src_label, ents)
+            if drop_sample:
+                db.delete_logs("샘플")
+            st.session_state.pop("sync_plan", None)
+            st.success(f"기존 {r['removed']}건을 {r['added']}건으로 교체했습니다.")
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
     elif not ents:
         st.error("반영할 기록이 없습니다. 열 매핑·헤더 행 번호·날짜 형식을 확인하세요.")
 

@@ -19,7 +19,7 @@ SKILL_COLS = ["member_id", "skill", "level"]
 TASK_COLS = ["id", "name", "owner_id", "backup_id", "importance", "status", "progress",
              "due_date", "required_skill", "remaining", "notes", "load_pct", "source"]
 LEAVE_COLS = ["id", "member_id", "start", "end", "type", "note"]
-LOG_COLS = ["id", "source", "track", "date", "member_id", "version", "category", "req", "tc", "issue"]
+LOG_COLS = ["id", "source", "track", "date", "member_id", "version", "subsystem", "category", "req", "tc", "func", "issue"]
 UNIT_SKILL = "단위테스트"  # 단위 테스트 인원 풀(이 역량 보유자만 단위 테스트 업무 수행 가능)
 
 
