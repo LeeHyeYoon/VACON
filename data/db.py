@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS leaves(id INTEGER PRIMARY KEY AUTOINCREMENT,
 CREATE TABLE IF NOT EXISTS work_logs(id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, track TEXT NOT NULL,
     log_date TEXT NOT NULL, member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
     version TEXT DEFAULT '', subsystem TEXT DEFAULT '', category TEXT DEFAULT '', req_done REAL DEFAULT 0, tc_done REAL DEFAULT 0,
-    func_done REAL DEFAULT 0, issue_done REAL DEFAULT 0, src_row INTEGER);
+    func_done REAL DEFAULT 0, issue_done REAL DEFAULT 0, new_req_done REAL, modified_req_done REAL, deleted_req_done REAL,
+    defect_done REAL, tc_created_done REAL, tc_modified_done REAL, tc_deleted_done REAL, notes TEXT DEFAULT '', src_row INTEGER);
 CREATE INDEX IF NOT EXISTS idx_logs_member_date ON work_logs(member_id, log_date);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS version_projects(
@@ -184,6 +185,11 @@ def _migrate(c) -> None:
         log_cols.add("subsystem")
     if "func_done" not in log_cols:
         c.execute("ALTER TABLE work_logs ADD COLUMN func_done REAL DEFAULT 0")
+    for name in ("new_req_done", "modified_req_done", "deleted_req_done", "defect_done", "tc_created_done",
+                 "tc_modified_done", "tc_deleted_done", "notes"):
+        if name not in log_cols:
+            c.execute(f"ALTER TABLE work_logs ADD COLUMN {name} TEXT DEFAULT NULL" if name == "notes"
+                      else f"ALTER TABLE work_logs ADD COLUMN {name} REAL DEFAULT NULL")
     vcols = {r["name"] for r in c.execute("PRAGMA table_info(version_projects)")}
     if "spec_owner_ids" not in vcols:
         c.execute("ALTER TABLE version_projects ADD COLUMN spec_owner_ids TEXT NOT NULL DEFAULT '[]'")
@@ -255,6 +261,11 @@ def load_team_data(path=None) -> TeamData:
     for g in logs:
         g["date"], g["req"], g["tc"], g["func"], g["issue"] = (_date(g.pop("log_date")), g.pop("req_done"),
             g.pop("tc_done"), g.pop("func_done", 0), g.pop("issue_done"))
+        for field, column in (("new_req", "new_req_done"), ("modified_req", "modified_req_done"),
+                              ("deleted_req", "deleted_req_done"), ("defect", "defect_done"),
+                              ("tc_created", "tc_created_done"), ("tc_modified", "tc_modified_done"),
+                              ("tc_deleted", "tc_deleted_done")):
+            g[field] = g.pop(column, None)
     return make_team(members, skills, tasks, leaves, logs)
 
 
@@ -544,21 +555,27 @@ def apply_sync_plan(plan: dict, label: str, path=None) -> dict:
 
 # --- 업무 로그 ---
 def replace_logs(source: str, entries: list[dict], path=None) -> dict:
-    """같은 출처(source)의 로그를 통째로 교체(시트가 원천). 한 트랜잭션."""
-    internal_versions = sorted({str(e.get("version") or "").strip() for e in entries
-                                if re.fullmatch(r"T\s*\d+", str(e.get("version") or "").strip(), re.IGNORECASE)
-                                and int(re.search(r"\d+", str(e.get("version"))).group()) >= 80})
-    if internal_versions:
-        raise ValueError("T0080 이상은 VACON 내부 업무로 관리합니다. Google Sheets 로그에서 제외하세요: "
-                         + ", ".join(internal_versions))
+    """Replace one sheet source while excluding rows owned by internal versions."""
+    is_internal = lambda value: bool(re.fullmatch(r"T\s*\d+", str(value or "").strip(), re.IGNORECASE)
+        and int(re.search(r"\d+", str(value)).group()) >= 800)
+    retained = [e for e in entries if not is_internal(e.get("version"))]
+    ignored_internal = len(entries) - len(retained)
+    if entries and not retained:
+        # A source sheet can contain only internally managed rows. Do not let
+        # that filtered preview erase a previously stored legacy source.
+        return {"removed": 0, "added": 0, "ignored_internal": ignored_internal}
     with connect(path) as c:
         removed = c.execute("SELECT COUNT(*) FROM work_logs WHERE source=?", (source,)).fetchone()[0]
         c.execute("DELETE FROM work_logs WHERE source=?", (source,))
-        c.executemany("INSERT INTO work_logs(source,track,log_date,member_id,version,subsystem,category,req_done,tc_done,func_done,issue_done,src_row) "
-                      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        c.executemany("""INSERT INTO work_logs(source,track,log_date,member_id,version,subsystem,category,
+                      req_done,tc_done,func_done,issue_done,new_req_done,modified_req_done,deleted_req_done,
+                      defect_done,tc_created_done,tc_modified_done,tc_deleted_done,notes,src_row)
+                      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                       [(source, e["track"], _iso(e["date"]), e["member_id"], e.get("version", ""), e.get("subsystem", ""), e.get("category", ""),
-                        e.get("req", 0), e.get("tc", 0), e.get("func", 0), e.get("issue", 0), e.get("row")) for e in entries])
-    return {"removed": removed, "added": len(entries)}
+                        e.get("req", 0), e.get("tc", 0), e.get("func", 0), e.get("issue", 0), e.get("new_req"),
+                        e.get("modified_req"), e.get("deleted_req"), e.get("defect"), e.get("tc_created"),
+                        e.get("tc_modified"), e.get("tc_deleted"), e.get("notes", ""), e.get("row")) for e in retained])
+    return {"removed": removed, "added": len(retained), "ignored_internal": ignored_internal}
 
 
 def delete_logs(source: str | None = None, path=None) -> int:
@@ -671,7 +688,7 @@ def save_version_worklog(project_id: int, phase: str, fields: dict, log_id: int 
             if not old:
                 raise ValueError("수정할 업무 기록이 없습니다.")
             assignments = ["subsystem_id=?", "log_date=?", "member_id=?", *[f"{key}=?" for key in metrics],
-                           "notes=?", "updated_at=CURRENT_TIMESTAMP"]
+                           "notes=?", "updated_at=strftime('%Y-%m-%d %H:%M:%f','now')"]
             c.execute(f"UPDATE {table} SET {','.join(assignments)} WHERE id=? AND project_id=?",
                       (subsystem_id, log_date, member_id, *values, str(fields.get("notes") or "").strip(), int(log_id), int(project_id)))
             return int(log_id)

@@ -5,11 +5,22 @@ import streamlit as st
 from data import db
 from services.models import TeamData, isnull, today
 from services.recommend import recommend_backups
+from services.internal_projects import is_internal_version
+from views.internal_work_page import _render_recommendations
 from views.common import header, show_df
 
 
 def render(team: TeamData, rules):
     header("🤝 대체 담당자", "추천은 검토용 참고 정보이며, '지정' 버튼을 눌러야만 반영됩니다.")
+    with st.expander("버전 계획 기반 AI 업무 분배", expanded=False):
+        projects = [p for p in db.list_version_projects() if is_internal_version(p["version"])]
+        if not projects:
+            st.info("AI 업무 분배에 사용할 T0800 이상 버전 계획이 없습니다.")
+        else:
+            by_id = {int(p["id"]): p for p in projects}
+            project_id = st.selectbox("배분 대상 버전", list(by_id),
+                format_func=lambda pid: by_id[pid]["version"], key="backup_distribution_version")
+            _render_recommendations(db.get_version_project(project_id), team)
     tasks = [t for t in team.task_records() if t.get("status") != "완료" and not isnull(t.get("owner_id"))]
     if not tasks:
         st.info("담당자가 지정된 진행 중 업무가 없습니다.")

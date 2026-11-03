@@ -29,8 +29,9 @@ def render(team, rules):
 
     logs_min, logs_max = min(team.logs["date"]), max(team.logs["date"])
     if "wl_range" not in st.session_state:
-        end0 = min(t, logs_max)                       # 기본: 기록이 있는 가장 최근 4주
-        st.session_state["wl_range"] = (max(logs_min, end0 - timedelta(days=27)), end0)
+        # Historical sheet logs often belong to older versions. Start with the
+        # complete imported range so a recent-activity default cannot hide them.
+        st.session_state["wl_range"] = (logs_min, logs_max)
 
     def _set(a, b):
         st.session_state["wl_range"] = (a, b)
@@ -46,19 +47,24 @@ def render(team, rules):
         st.info("시작일과 종료일을 모두 선택하세요.")
         return
     p_start, p_end = rng
+    version_values = sorted({str(v).strip() for v in team.logs["version"].dropna()
+                             if str(v).strip()}, key=wl.version_sort_key, reverse=True)
+    selected_version = st.selectbox("버전", ["(전체)", *version_values], key="wl_version")
+    version_filter = None if selected_version == "(전체)" else selected_version
     if not wl.workdays(p_start, p_end):
         st.warning("선택한 기간에 근무일(월~금)이 없습니다.")
         return
-    st.caption(f"기록이 있는 기간: {logs_min} ~ {logs_max} · 선택 기간 근무일 {len(wl.workdays(p_start, p_end))}일")
+    st.caption(f"조회 대상: {selected_version} · 기록 기간 {logs_min} ~ {logs_max} · 선택 기간 근무일 {len(wl.workdays(p_start, p_end))}일")
     tab1, tab2, tab3 = st.tabs(["처리량", "휴가 영향 예측", "인력 가용 현황"])
 
     with tab1:
-        tbl = wl.throughput_table(team, p_start, p_end, rules)
+        tbl = wl.throughput_table(team, p_start, p_end, rules, version_filter)
         for track, name in wl.TRACKS.items():
             st.subheader(name)
             sub = tbl[tbl["업무"] == name].dropna(axis=1, how="all").drop(columns="업무")
             show_df(sub)
-            recs = [r for r in team.logs.to_dict("records") if r["track"] == track and p_start <= r["date"] <= p_end]
+            recs = [r for r in team.logs.to_dict("records") if r["track"] == track and p_start <= r["date"] <= p_end
+                    and (version_filter is None or str(r.get("version") or "").strip().casefold() == version_filter.casefold())]
             if recs:
                 df = pd.DataFrame(recs)
                 df["팀원"] = df["member_id"].map(team.name)
@@ -77,8 +83,9 @@ def render(team, rules):
             by_id = {lv["id"]: lv for lv in leaves}
             lid = st.selectbox("휴가 선택", list(by_id), format_func=lambda i: fmt_leave(team, by_id[i]))
             lv = by_id[lid]
-            res = wl.leave_impact(team, lv["member_id"], lv["start"], lv["end"], t, rules=rules, base_start=p_start, base_end=p_end)
-            st.write(f"**{res['name']}** 님 휴가 근무일 **{res['lost_days']}일** — 집계 기간 **{p_start} ~ {p_end}**의 일평균을 기준으로 예상 처리 공백과 분담 시 부담을 계산합니다.")
+            res = wl.leave_impact(team, lv["member_id"], lv["start"], lv["end"], t, rules=rules, base_start=p_start, base_end=p_end,
+                                  version=version_filter)
+            st.write(f"**{res['name']}** 님 휴가 근무일 **{res['lost_days']}일** — **{selected_version} · {p_start} ~ {p_end}**의 일평균을 기준으로 예상 처리 공백과 분담 시 부담을 계산합니다.")
             if res["pool_overlap_days"]:
                 st.warning("단위 테스트 인원 다수가 함께 부재인 날: " + ", ".join(fmt_date(d) for d in res["pool_overlap_days"]))
             for it in res["items"]:

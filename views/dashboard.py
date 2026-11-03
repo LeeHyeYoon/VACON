@@ -9,7 +9,7 @@ from services.models import today
 from services.version_projects import aggregate_version_logs, project_summary
 from services.internal_projects import dashboard as internal_dashboard, is_internal_version, is_legacy_sheet_version
 from data import db
-from views.common import LEVEL_COLORS, fmt_date, header, risk_table, show_df
+from views.common import LEVEL_COLORS, fmt_date, header
 
 
 def render(team, rules):
@@ -96,23 +96,3 @@ def render(team, rules):
         fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="가용 인원(명)")
         st.plotly_chart(fig)
         st.caption("막대 색 = 해당 날짜 최고 위험도 (🔴 High · 🟠 Medium · 🟢 Low · ⚪ 데이터 부족). 반차는 0.5명 부재로 계산.")
-
-    risks = m["risks"]
-    st.subheader("위험도가 높은 업무")
-    high = risks[risks["위험도"] == risk.HIGH] if not risks.empty else risks
-    if high.empty:
-        st.success("분석 기간에 High 위험 업무가 없습니다.")
-    else:
-        show_df(risk_table(high, ["업무", "담당자", "대체 담당자", "마감일", "위험도", "점수", "대표 날짜", "근거"]))
-
-    st.subheader("위험 항목별 대응 방안")
-    targets = risks[risks["위험도"].isin([risk.HIGH, risk.MEDIUM])] if not risks.empty else risks
-    if targets.empty:
-        st.write("대응이 필요한 위험 항목이 없습니다.")
-    for _, r in targets.head(8).iterrows():
-        with st.expander(f"{r['위험도']} · {r['업무']} ({r['담당자']}) · {r['점수']:.0f}점"):
-            for _, text, pts in r["근거"]:
-                st.write(f"- {text}" + (f" **(+{pts})**" if pts else ""))
-            st.markdown("**권장 대응**")
-            for a in r["대응 방안"] or ["별도 권장 조치 없음"]:
-                st.write(f"- {a}")

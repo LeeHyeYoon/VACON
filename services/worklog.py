@@ -19,11 +19,27 @@ from .sheet_sync import SheetError, match_owner, parse_sheet_date_ex
 TRACKS = {"dynamic": "동적 검증", "req": "요구사양서 작성"}
 LOG_ROLES = {"log_dynamic": "dynamic", "log_req": "req"}
 METRIC_COLS = {"dynamic": ("tc", "req", "func"), "req": ("issue",)}
-METRIC_LABELS = {"tc": "실행 TC", "req": "완료 Req", "func": "완료 Func", "issue": "완료 일감"}
+METRIC_LABELS = {"tc": "실행 TC", "req": "완료 요구사양서", "func": "완료 함수", "issue": "완료 일감",
+                 "new_req": "신규 요구사양", "modified_req": "수정 요구사양", "deleted_req": "삭제 요구사양",
+                 "defect": "결함", "tc_created": "생성 TC", "tc_modified": "수정 TC", "tc_deleted": "삭제 TC"}
+LOG_METRICS = {"dynamic": ("req", "func", "defect", "tc", "tc_created", "tc_modified", "tc_deleted"),
+               "req": ("issue", "new_req", "modified_req", "deleted_req")}
+LOG_HEADER_ALIASES = {
+    "dynamic": {"defect": ("결함", "Defect", "Defects"), "tc_created": ("TC 생성", "생성 TC", "TC Created"),
+                "tc_modified": ("TC 수정", "수정 TC", "TC Modified"), "tc_deleted": ("TC 삭제", "삭제 TC", "TC Deleted"),
+                "notes": ("특이사항", "비고", "Notes")},
+    "req": {"new_req": ("생성", "신규", "신규 요구사양", "New Requirements"),
+            "modified_req": ("수정", "수정 요구사양", "Modified Requirements"),
+            "deleted_req": ("삭제", "삭제 요구사양", "Deleted Requirements"),
+            "notes": ("비고(이슈)", "특이사항", "비고", "Notes")},
+}
 LOG_FIELDS = {
     "dynamic": [("date", "날짜"), ("member", "담당자"), ("version", "버전"), ("subsystem", "서브시스템"), ("category", "업무 구분"),
-                ("req", "완료한 Req"), ("tc", "실행한 TC"), ("func", "완료한 Func")],
-    "req": [("date", "날짜"), ("member", "담당자"), ("version", "버전"), ("subsystem", "서브시스템"), ("category", "업무 구분"), ("issue", "완료 일감")],
+                ("req", "완료 요구사양서"), ("tc", "실행 TC"), ("func", "완료 함수"), ("defect", "결함"),
+                ("tc_created", "생성 TC"), ("tc_modified", "수정 TC"), ("tc_deleted", "삭제 TC"), ("notes", "특이사항")],
+    "req": [("date", "날짜"), ("member", "담당자"), ("version", "버전"), ("subsystem", "서브시스템"), ("category", "업무 구분"),
+            ("issue", "완료 일감"), ("new_req", "신규 요구사양"), ("modified_req", "수정 요구사양"),
+            ("deleted_req", "삭제 요구사양"), ("notes", "특이사항")],
 }
 OVERLOAD_PCT = 30  # 분담 시 평소 대비 증가율이 이 값 이상이면 부담 큼으로 표시
 
@@ -120,20 +136,40 @@ def parse_logs(text: str, cfg: dict, team: TeamData, today: date | None = None) 
     hint = f" 헤더가 {guess}행에 있는 것 같습니다 — 헤더 행 번호를 {guess}로 바꿔 보세요." if guess and guess != hr else ""
     header = rows[hr - 1]
     changed = []
+    moved = []
     for f, saved in (cfg.get("headers") or {}).items():
         if f in cols and saved:
             i = col_index(cols[f])
             cur = header[i].strip() if i < len(header) else ""
             if cur != saved:
-                changed.append(f"{cols[f]}열 제목 '{saved}' → '{cur}'")
+                hits = [j for j, name in enumerate(header) if name.strip() == saved]
+                if hits:
+                    # Saved header text takes precedence over an old column
+                    # address, so reordered source columns continue to map.
+                    cols[f] = col_letter(hits[0])
+                    moved.append(f"{f}: {cols[f]}열에서 '{saved}' 헤더를 찾음")
+                else:
+                    changed.append(f"{cols[f]}열 제목 '{saved}' → '{cur}' (같은 제목을 찾지 못함)")
     if changed:
         raise SheetError("시트의 열 구성이 바뀐 것 같습니다(" + "; ".join(changed) + "). 열 매핑을 확인하고 다시 저장하세요." + hint)
+
+    # Newly supported fields are matched from the actual, unique header text;
+    # no column positions are assumed for these optional source metrics.
+    for field, aliases in LOG_HEADER_ALIASES[track].items():
+        if field in cols:
+            continue
+        wanted = {re.sub(r"\s+", "", value).casefold() for value in aliases}
+        hits = [i for i, name in enumerate(header) if re.sub(r"\s+", "", name).casefold() in wanted]
+        if len(hits) == 1:
+            cols[field] = col_letter(hits[0])
 
     fill, year = bool(cfg.get("fill_down")), cfg.get("year") or None
     entries, warnings, unmatched = [], [], set()
     bad_dates: Counter = Counter()
     text_cells = skipped = blank_date_rows = inferred = 0
     last_date = last_member = None
+    if moved:
+        warnings.append("저장된 헤더 이름을 기준으로 이동한 열을 다시 연결했습니다: " + "; ".join(moved))
     for n, row in enumerate(rows[hr:], start=hr + 1):
         if not any(c.strip() for c in row):
             continue
@@ -166,8 +202,10 @@ def parse_logs(text: str, cfg: dict, team: TeamData, today: date | None = None) 
             warnings.append(f"{n}행: {note}")
         e = {"track": track, "date": d, "member_id": mid, "version": get("version"),
              "subsystem": get("subsystem"), "category": get("category"),
-             "req": 0.0, "tc": 0.0, "func": 0.0, "issue": 0.0, "row": n}
-        for m in ("req", "tc", "func", "issue"):
+             **{m: None for m in ("req", "tc", "func", "issue", "new_req", "modified_req", "deleted_req",
+                                  "defect", "tc_created", "tc_modified", "tc_deleted")},
+             "notes": get("notes"), "row": n}
+        for m in LOG_METRICS[track]:
             if m in cols:
                 v, kind = parse_count(get(m))
                 e[m] = v

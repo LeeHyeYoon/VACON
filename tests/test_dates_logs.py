@@ -1,10 +1,12 @@
 import unittest
 from datetime import date, timedelta
+from unittest.mock import patch
 
 from services import sheet_sync as ss
 from services import worklog as wl
 from services.version_projects import aggregate_version_logs, project_summary
 from services.models import make_team
+from views.worklog_page import _records
 
 REF = date(2026, 10, 26)
 D = lambda n: date(2026, 10, 12) + timedelta(days=n)
@@ -99,6 +101,17 @@ class LogParseTests(unittest.TestCase):
 
 
 class PeriodTests(unittest.TestCase):
+    def test_worklog_view_excludes_seed_sample_and_keeps_imported_history(self):
+        rows = [{"id": 1, "source": "\uc0d8\ud50c", "track": "dynamic", "date": D(0), "member_id": 1,
+                 "version": "v2.1", "req": 1, "func": 2, "tc": 3},
+                {"id": 2, "source": "2. Dynamic_Verification", "track": "dynamic", "date": D(1), "member_id": 1,
+                 "version": "T0700", "subsystem": "Audio", "req": 4, "func": 5, "tc": 6, "defect": 1}]
+        with patch("views.worklog_page.db.list_all_internal_worklogs", return_value=[]):
+            records = _records(team(rows))
+        self.assertEqual(records["\ubc84\uc804"].tolist(), ["T0700"])
+        row = records.iloc[0]
+        self.assertEqual((row["\uc644\ub8cc \uc694\uad6c\uc0ac\uc591\uc11c"], row["\uc644\ub8cc \ud568\uc218"], row["\uacb0\ud568"]), (4, 5, 1))
+
     def test_natural_version_sort_places_newer_numeric_versions_first(self):
         versions = sorted(["T2", "T0800", "T0700", "T10"], key=wl.version_sort_key, reverse=True)
         self.assertEqual(versions, ["T0800", "T0700", "T10", "T2"])

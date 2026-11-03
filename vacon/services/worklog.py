@@ -169,11 +169,19 @@ def _records(team: TeamData) -> list[dict]:
     return team.logs.to_dict("records") if len(team.logs) else []
 
 
-def member_stats(team: TeamData, member_id: int, track: str, start: date, end: date, rules: dict | None = None) -> dict:
+def version_sort_key(value: str):
+    """Sort version labels naturally so T0700 is ordered before T0600."""
+    return tuple((0, int(part)) if part.isdigit() else (1, part.casefold())
+                 for part in re.split(r"(\d+)", str(value or "")) if part)
+
+
+def member_stats(team: TeamData, member_id: int, track: str, start: date, end: date,
+                 rules: dict | None = None, version: str | None = None) -> dict:
     """기간 내 개인 처리량. 일평균은 '근무일(주말·종일 휴가 제외)' 기준. 로그가 전혀 없으면 has_logs=False(0으로 간주하지 않음)."""
     rules = merge_rules(rules)
     days = [d for d in workdays(start, end) if member_id not in absent_map(team, d, rules)]
-    recs = [r for r in _records(team) if r["member_id"] == member_id and r["track"] == track and start <= r["date"] <= end]
+    recs = [r for r in _records(team) if r["member_id"] == member_id and r["track"] == track and start <= r["date"] <= end
+            and (version is None or str(r.get("version") or "").strip().casefold() == version.strip().casefold())]
     cols = METRIC_COLS[track]
     sums = {m: sum(r[m] for r in recs) for m in cols}
     return {"workdays": len(days), "sum": sums, "has_logs": bool(recs),
@@ -182,12 +190,13 @@ def member_stats(team: TeamData, member_id: int, track: str, start: date, end: d
             "last_date": max((r["date"] for r in recs), default=None)}
 
 
-def throughput_table(team: TeamData, start: date, end: date, rules: dict | None = None) -> pd.DataFrame:
+def throughput_table(team: TeamData, start: date, end: date, rules: dict | None = None,
+                     version: str | None = None) -> pd.DataFrame:
     """[start, end] 기간의 팀원·업무별 처리량."""
     rows = []
     for mid in sorted(team.unit_pool()):
         for track, tname in TRACKS.items():
-            st = member_stats(team, mid, track, start, end, rules)
+            st = member_stats(team, mid, track, start, end, rules, version)
             row = {"팀원": team.name(mid), "업무": tname, "근무일": st["workdays"], "활동일": st["active_days"],
                    "최근 기록일": st["last_date"] or "기록 없음"}
             for m in METRIC_COLS[track]:
@@ -199,7 +208,8 @@ def throughput_table(team: TeamData, start: date, end: date, rules: dict | None 
 
 def leave_impact(team: TeamData, member_id: int, start: date, end: date, today: date,
                  window_days: int = 28, rules: dict | None = None,
-                 base_start: date | None = None, base_end: date | None = None) -> dict:
+                 base_start: date | None = None, base_end: date | None = None,
+                 version: str | None = None) -> dict:
     """휴가로 비는 처리량(최근 일평균 × 휴가 근무일)과, 다른 단위 테스트 인원이 나눠 맡을 때의 추가 부담."""
     rules = merge_rules(rules)
     pool = team.unit_pool()
@@ -214,7 +224,7 @@ def leave_impact(team: TeamData, member_id: int, start: date, end: date, today: 
     out["pool_overlap_days"] = [d for d in lost
                                 if sum(1 for o in others if o in absent_map(team, d, rules)) >= max(1, len(others) // 2)]
     for track in TRACKS:
-        mine = member_stats(team, member_id, track, w0, w1, rules)
+        mine = member_stats(team, member_id, track, w0, w1, rules, version)
         for m in METRIC_COLS[track]:
             item = {"track": track, "metric": m, "label": f"{TRACKS[track]} · {METRIC_LABELS[m]}", "avg": None,
                     "gap": None, "rows": [], "excluded": [], "warnings": []}
@@ -225,7 +235,7 @@ def leave_impact(team: TeamData, member_id: int, start: date, end: date, today: 
             cand = []
             for o in others:
                 avail = [d for d in lost if o not in absent_map(team, d, rules)]
-                st = member_stats(team, o, track, w0, w1, rules)
+                st = member_stats(team, o, track, w0, w1, rules, version)
                 if not avail:
                     item["excluded"].append(f"{team.name(o)}: 대체 기간 내 근무 가능일 없음"); continue
                 if not st["has_logs"] or not st["avg"][m]:

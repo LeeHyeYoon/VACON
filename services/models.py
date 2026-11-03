@@ -19,8 +19,11 @@ SKILL_COLS = ["member_id", "skill", "level"]
 TASK_COLS = ["id", "name", "owner_id", "backup_id", "importance", "status", "progress",
              "due_date", "required_skill", "remaining", "notes", "load_pct", "source"]
 LEAVE_COLS = ["id", "member_id", "start", "end", "type", "note"]
-LOG_COLS = ["id", "source", "track", "date", "member_id", "version", "subsystem", "category", "req", "tc", "func", "issue"]
-UNIT_SKILL = "단위테스트"  # 단위 테스트 인원 풀(이 역량 보유자만 단위 테스트 업무 수행 가능)
+LOG_COLS = ["id", "source", "track", "date", "member_id", "version", "subsystem", "category", "req", "tc", "func", "issue",
+            "new_req", "modified_req", "deleted_req", "defect", "tc_created", "tc_modified", "tc_deleted", "notes", "src_row"]
+# 업무 범위에서 허용하는 지정 단위 검증 담당자 명단.
+UNIT_SKILL = "단위테스트"
+UNIT_VERIFICATION_MEMBER_NAMES = frozenset({"김재강", "주해원", "황지원", "이혜윤"})
 
 
 def required_skills(value) -> list[str]:
@@ -84,7 +87,14 @@ class TeamData:
         return {int(m) for m in set.intersection(*sets)} if sets else set()
 
     def unit_pool(self) -> set:
-        return self.skill_holders([UNIT_SKILL])
+        allowed_names = {str(name).strip() for name in UNIT_VERIFICATION_MEMBER_NAMES}
+        return {int(row["id"]) for row in self.member_records()
+                if str(row.get("name") or "").strip() in allowed_names}
+
+    def unit_members(self) -> list[dict]:
+        """The explicitly designated four-person unit verification roster."""
+        allowed_ids = self.unit_pool()
+        return [row for row in self.member_records() if int(row["id"]) in allowed_ids]
 
     def task_records(self) -> list[dict]:
         return self.tasks.to_dict("records")

@@ -86,6 +86,16 @@ class LetterAndParseTests(unittest.TestCase):
         with self.assertRaisesRegex(SheetError, "열 구성이 바뀐"):
             wl.parse_logs(shifted, CFG_DYN, team())
 
+    def test_saved_headers_follow_columns_when_sheet_reorders_them(self):
+        text = "메모,버전,실행 TC,날짜,완료한 Req,담당자,업무 구분\nraw,v7,12,2026-10-19,4,주해원,검증\n"
+        cfg = {"role": "log_dynamic", "header_row": 1,
+               "columns": {"date": "A", "member": "B", "version": "C", "category": "D", "req": "I", "tc": "O"},
+               "headers": {"date": "날짜", "member": "담당자", "version": "버전", "category": "업무 구분",
+                           "req": "완료한 Req", "tc": "실행 TC"}}
+        result = wl.parse_logs(text, cfg, team())
+        self.assertEqual((result["entries"][0]["version"], result["entries"][0]["req"], result["entries"][0]["tc"]),
+                         ("v7", 4.0, 12.0))
+
     def test_config_errors(self):
         with self.assertRaises(SheetError): wl.parse_logs("a\n", {"role": "tasks"}, team())
         with self.assertRaises(SheetError): wl.parse_logs("a\n", {**CFG_DYN, "columns": {"date": "A"}}, team())
@@ -96,7 +106,22 @@ class LetterAndParseTests(unittest.TestCase):
         cfg = {"role": "log_req", "header_row": 1, "headers": {}, "columns": {"date": "A", "member": "B", "issue": "G"}}
         csv_ = "날짜,담당자,v,c,d,e,완료 일감\n2026-10-19,황지원,v1,x,,,4\n"
         r = wl.parse_logs(csv_, cfg, team())
-        self.assertEqual((r["track"], r["entries"][0]["issue"], r["entries"][0]["tc"]), ("req", 4.0, 0.0))
+        self.assertEqual((r["track"], r["entries"][0]["issue"], r["entries"][0]["tc"]), ("req", 4.0, None))
+
+    def test_source_headers_auto_map_all_history_metrics_and_notes(self):
+        dyn = "특이사항,TC 삭제,날짜,결함,담당자,TC 생성,버전,완료Func,TC 수정,완료Req,TC 실행,서브시스템,업무 구분\n"
+        dyn += "case note,2,2026-10-19,1,주해원,3,T0700,4,5,6,7,Audio,검증\n"
+        dc = {"role": "log_dynamic", "header_row": 1, "headers": {},
+              "columns": {"date": "C", "member": "E", "version": "G", "subsystem": "L", "category": "M", "req": "J", "tc": "K", "func": "H"}}
+        d = wl.parse_logs(dyn, dc, team())["entries"][0]
+        self.assertEqual((d["defect"], d["tc_created"], d["tc_modified"], d["tc_deleted"], d["notes"]), (1.0, 3.0, 5.0, 2.0, "case note"))
+        spec = "삭제,담당자,버전,비고(이슈),생성,날짜,수정,완료 일감,서브시스템,사양서 작성\n"
+        spec += "1,김재강,T0030,legacy note,2,2026-10-20,3,8,Display,사양서 작성\n"
+        sc = {"role": "log_req", "header_row": 1, "headers": {},
+              "columns": {"date": "F", "member": "B", "version": "C", "subsystem": "I", "category": "J", "issue": "H"}}
+        s = wl.parse_logs(spec, sc, team())["entries"][0]
+        self.assertEqual((s["issue"], s["new_req"], s["modified_req"], s["deleted_req"], s["notes"]),
+                         (8.0, 2.0, 3.0, 1.0, "legacy note"))
 
 
 class StatsTests(unittest.TestCase):
@@ -246,8 +271,8 @@ class DbAndIntegrationTests(unittest.TestCase):
         ents = wl.parse_logs(CSV_DYN, CFG_DYN, db.load_team_data(self.path))["entries"]
         # CSV의 이름이 샘플 팀원 이름과 달라 0건일 수 있으므로 직접 엔트리 구성
         ents = [{"track": "dynamic", "date": date(2026, 10, 19), "member_id": 4, "version": "v1", "subsystem": "Audio", "category": "c", "req": 3, "tc": 20, "func": 9, "row": 2}]
-        self.assertEqual(db.replace_logs("시트A", ents, self.path), {"removed": 0, "added": 1})
-        self.assertEqual(db.replace_logs("시트A", ents + ents, self.path), {"removed": 1, "added": 2})   # 교체(누적 아님)
+        self.assertEqual(db.replace_logs("시트A", ents, self.path), {"removed": 0, "added": 1, "ignored_internal": 0})
+        self.assertEqual(db.replace_logs("시트A", ents + ents, self.path), {"removed": 1, "added": 2, "ignored_internal": 0})   # 교체(누적 아님)
         t = db.load_team_data(self.path)
         self.assertEqual(int((t.logs["source"] == "시트A").sum()), 2)
         self.assertEqual(len(t.logs), n_sample + 2)

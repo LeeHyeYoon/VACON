@@ -270,12 +270,15 @@ def _show_log_plan(team, sp, src_label):
     m[3].metric("기간", f"{res['date_range'][0]} ~ {res['date_range'][1]}" if res["date_range"] else "-")
     if ents:
         df = pd.DataFrame(ents)
-        cols = [c for c in wl.METRIC_COLS[res["track"]]]
-        agg = df.groupby("member_id")[cols].sum().reset_index()
+        cols = list(wl.LOG_METRICS[res["track"]])
+        agg = df.groupby("member_id")[cols].sum(min_count=1).reset_index()
         agg.insert(0, "팀원", agg["member_id"].map(team.name))
         agg = agg.drop(columns="member_id").rename(columns={c: wl.METRIC_LABELS[c] + " 합계" for c in cols})
         st.write("**팀원별 합계(미리보기)** — 값이 시트와 맞는지 확인하세요.")
         show_df(agg)
+        by_version = df.assign(버전=df["version"].fillna("").astype(str).str.strip().replace("", "(버전 미입력)"))
+        st.write("**버전별 원본 행 수(미리보기)**")
+        show_df(by_version.groupby("버전", as_index=False).size().rename(columns={"size": "기록 행 수"}))
         non_pool = [team.name(i) for i in df["member_id"].unique() if i not in team.unit_pool()]
         if non_pool:
             st.warning("단위 테스트 인원이 아닌 팀원의 기록이 포함되어 있습니다: " + ", ".join(non_pool) + " (집계·예측은 단위 테스트 인원만 대상으로 합니다)")
@@ -295,7 +298,8 @@ def _show_log_plan(team, sp, src_label):
             if drop_sample:
                 db.delete_logs("샘플")
             st.session_state.pop("sync_plan", None)
-            st.success(f"기존 {r['removed']}건을 {r['added']}건으로 교체했습니다.")
+            suffix = f" · 내부 DB 관리 버전 {r['ignored_internal']}건은 시트에서 제외했습니다." if r.get("ignored_internal") else ""
+            st.success(f"기존 {r['removed']}건을 {r['added']}건으로 교체했습니다.{suffix}")
             st.rerun()
         except ValueError as exc:
             st.error(str(exc))

@@ -1,27 +1,16 @@
-"""T0080+ 버전 업무의 VACON 내부 등록·기록·진척도·승인 배정 화면."""
-from datetime import date
+"""PM용 단위 검증 버전 일정 및 계획 화면."""
+import re
 
 import pandas as pd
 import streamlit as st
 
 from data import db
 from services import llm
-from services.internal_projects import dashboard, internal_projects, is_internal_version, recommend_distribution
+from services.internal_projects import dashboard, is_internal_version, recommend_distribution
 from services.models import today
 from views.common import header, show_df
 
 WORKLOG_PAGE = None
-
-
-SPEC_FIELDS = [
-    ("completed_tasks", "완료 일감 개수"), ("new_requirements", "신규 요구사양 개수"),
-    ("modified_requirements", "수정 요구사양 개수"), ("deleted_requirements", "삭제 요구사양 개수"),
-]
-VERIFY_FIELDS = [
-    ("completed_requirements", "완료 요구사양서 개수"), ("completed_functions", "완료 함수 개수"),
-    ("defects", "결함 개수"), ("tc_executed", "실행 TC 개수"), ("tc_created", "생성 TC 개수"),
-    ("tc_modified", "수정 TC 개수"), ("tc_deleted", "삭제 TC 개수"),
-]
 
 
 def _save_project(project, **changes):
@@ -31,14 +20,16 @@ def _save_project(project, **changes):
         "spec_registered", "verify_registered", "spec_owner_id", "verify_owner_id", "spec_owner_ids",
         "verify_owner_ids", "source_info", "notes", "holidays", "daily_spec_capacity", "daily_verify_capacity")}
     fields.update(changes)
-    return db.save_version_project(fields, project_id=int(project["id"]))
+    saved = db.save_version_project(fields, project_id=int(project["id"]))
+    st.cache_data.clear()
+    return saved
 
 
 def _create_version_form():
-    with st.expander("＋ VACON 내부 버전 생성", expanded=False):
-        st.caption("T0080 이상은 이후의 사전 물량·업무 기록을 Google Sheets와 분리해 VACON 내부 DB에 저장합니다.")
+    with st.expander("＋ 버전 생성", expanded=False):
+        st.caption("계획은 T0800 이상 신규 버전에만 등록합니다. 이전 버전 기록은 Google Sheets 원본을 조회합니다.")
         with st.form("internal_version_create", clear_on_submit=True):
-            version = st.text_input("버전명", placeholder="예: T0080")
+            version = st.text_input("버전명", placeholder="예: T0800")
             c = st.columns(2)
             spec_due = c[0].date_input("요구사양서 작성 마감일", value=today(), key="new_internal_spec_due")
             verify_due = c[1].date_input("동적 검증 마감일", value=today(), key="new_internal_verify_due")
@@ -48,8 +39,9 @@ def _create_version_form():
                 normalized = str(version or "").strip()
                 if not normalized:
                     raise ValueError("버전명을 입력하세요.")
-                if not is_internal_version(normalized):
-                    raise ValueError("T0070 이하는 기존 Google Sheets 연동 경로를 사용합니다. 내부 버전은 T0080 이상으로 입력하세요.")
+                match = re.fullmatch(r"T\s*(\d+)", normalized, re.IGNORECASE)
+                if not match or int(match.group(1)) < 800:
+                    raise ValueError("계획 등록은 T0800 이상 버전에서만 가능합니다. 과거 버전은 Google Sheets 조회 전용입니다.")
                 if any(p["version"].casefold() == normalized.casefold() for p in db.list_version_projects()):
                     raise ValueError("같은 버전이 이미 등록되어 있습니다.")
                 db.save_version_project({
@@ -134,6 +126,7 @@ def _schedule_and_workload(project):
                     try:
                         db.save_version_workload(project["id"], phase, subsystem, total_tasks=total_tasks,
                             total_functions=total_functions, total_requirements=total_requirements, difficulty=difficulty)
+                        st.cache_data.clear()
                         st.success("서브시스템 물량을 저장했습니다.")
                         st.rerun()
                     except Exception as exc:
@@ -148,64 +141,6 @@ def _schedule_and_workload(project):
                 show_df(pd.DataFrame(frame))
 
 
-def _work_metrics(phase):
-    return SPEC_FIELDS if phase == "spec" else VERIFY_FIELDS
-
-
-def _render_log_form(project, team, phase, workloads):
-    logs = db.list_version_worklogs(project["id"], phase)
-    if not workloads:
-        st.info("먼저 '일정/물량' 탭에서 서브시스템별 목표 물량을 등록하세요.")
-        return
-    members = team.member_records()
-    if not members:
-        st.info("업무 기록을 위해 데이터 관리에서 담당자를 먼저 등록하세요.")
-        return
-    action = st.radio("기록 작업", ["신규 기록", "기록 수정/삭제"], horizontal=True,
-                      key=f"log_action_{phase}_{project['id']}")
-    selected_log = None
-    if action == "기록 수정/삭제":
-        if not logs:
-            st.info("수정할 기록이 없습니다.")
-            return
-        selected_log = st.selectbox("업무 기록", logs,
-            format_func=lambda x: f"#{x['id']} · {x['date']} · {x['member_name']} · {x['subsystem']}",
-            key=f"log_pick_{phase}_{project['id']}")
-    field_map = {key: label for key, label in _work_metrics(phase)}
-    workload_by_name = {w["subsystem"]: w for w in workloads}
-    member_ids = [int(m["id"]) for m in members]
-    selected_member = int(selected_log["member_id"]) if selected_log else member_ids[0]
-    selected_subsystem = selected_log["subsystem"] if selected_log else workloads[0]["subsystem"]
-    with st.form(f"log_form_{phase}_{project['id']}_{selected_log['id'] if selected_log else 'new'}"):
-        c = st.columns(3)
-        entry_date = c[0].date_input("날짜", value=selected_log["date"] if selected_log else today(),
-                                     key=f"log_date_{phase}_{project['id']}_{selected_log['id'] if selected_log else 'new'}")
-        member_id = c[1].selectbox("담당자", member_ids, index=member_ids.index(selected_member),
-            format_func=lambda mid: team.name(mid), key=f"log_member_{phase}_{project['id']}_{selected_log['id'] if selected_log else 'new'}")
-        subsystem = c[2].selectbox("서브시스템", list(workload_by_name),
-            index=list(workload_by_name).index(selected_subsystem), key=f"log_subsystem_{phase}_{project['id']}_{selected_log['id'] if selected_log else 'new'}")
-        fields = {"date": entry_date, "member_id": member_id, "subsystem": subsystem}
-        cols = st.columns(2)
-        for i, (metric, label) in enumerate(field_map.items()):
-            fields[metric] = cols[i % 2].number_input(label, min_value=0,
-                value=int(selected_log.get(metric, 0) if selected_log else 0), step=1,
-                key=f"metric_{phase}_{metric}_{project['id']}_{selected_log['id'] if selected_log else 'new'}")
-        fields["notes"] = st.text_area("특이사항", value=selected_log["notes"] if selected_log else "",
-            key=f"log_notes_{phase}_{project['id']}_{selected_log['id'] if selected_log else 'new'}")
-        button_label = "업무 기록 수정" if selected_log else "업무 기록 저장"
-        if st.form_submit_button(button_label):
-            try:
-                db.save_version_worklog(project["id"], phase, fields, log_id=selected_log["id"] if selected_log else None)
-                st.success("업무 기록을 저장했습니다.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"업무 기록을 저장하지 못했습니다: {exc}")
-    if selected_log and st.button("선택한 업무 기록 삭제", key=f"log_delete_{phase}_{project['id']}_{selected_log['id']}"):
-        if db.delete_version_worklog(project["id"], phase, selected_log["id"]):
-            st.success("업무 기록을 삭제했습니다.")
-            st.rerun()
-
-
 def _render_phase(project, team, phase):
     title = "요구사양서 작성" if phase == "spec" else "동적 검증"
     workloads = db.list_version_workloads(project["id"], phase)
@@ -213,20 +148,35 @@ def _render_phase(project, team, phase):
     report = dashboard(project, phase, workloads, logs, today())
     st.subheader(f"{title} 진척도")
     deadline_name = "요구사양서 작성" if phase == "spec" else "동적 검증"
-    st.metric(f"{deadline_name} 마감까지", "미등록" if report["remaining_days"] is None else f"{report['remaining_days']}일")
+    due = report["due"]
+    if due is None:
+        deadline = "마감일 미등록"
+    elif due < today():
+        deadline = f"마감일이 지났습니다 · { (today() - due).days }일 경과"
+    elif due == today():
+        deadline = "오늘 마감"
+    else:
+        deadline = f"마감까지 { (due - today()).days }일 남았습니다"
+    st.info(f"{deadline_name} {deadline}")
     totals = report["totals"]
     if phase == "spec":
         c = st.columns(3)
         c[0].metric("전체 일감", totals["total_tasks"])
         c[1].metric("완료 일감", totals["completed_tasks"])
-        c[2].metric("전체 진척도", f"{totals['progress']:.0%}")
+        c[2].metric("전체 진척도", f"{totals['progress']:.0%}" if totals["total_tasks"] else "계획 데이터 없음")
+        if totals["total_tasks"]:
+            st.progress(min(1.0, max(0.0, totals["progress"])))
         rows = []
         for item in report["subsystems"]:
             rows.append({"서브시스템": item["subsystem"], "전체 일감": item["total"], "완료 일감": item["done"],
-                         "잔여 일감": item["remaining"], "진척도": f"{item['progress']:.0%}", "난이도": item["difficulty"]})
+                         "잔여 일감": item["remaining"], "진척도": f"{item['progress']:.0%}" if item["total"] else "계획 데이터 없음", "난이도": item["difficulty"]})
         if rows:
             st.write("**서브시스템별 현황**")
-            show_df(pd.DataFrame(rows))
+            for row in rows:
+                st.write(f"**{row['서브시스템']}** · 계획 {row['전체 일감']} · 완료 {row['완료 일감']} · 잔여 {row['잔여 일감']} · {row['진척도']}")
+                if row["전체 일감"]:
+                    progress = next(x["progress"] for x in report["subsystems"] if x["subsystem"] == row["서브시스템"])
+                    st.progress(min(1.0, max(0.0, progress)))
         if report["members"]:
             st.write("**담당자별 완료 및 요구사양 변경량**")
             show_df(pd.DataFrame([{"담당자": r["담당자"], "완료 일감": r["completed_tasks"],
@@ -236,43 +186,39 @@ def _render_phase(project, team, phase):
         c = st.columns(4)
         c[0].metric("전체 함수", totals["total_functions"])
         c[1].metric("완료 함수", totals["completed_functions"])
-        c[2].metric("함수 진척도", f"{totals['function_progress']:.0%}")
+        c[2].metric("함수 진척도", f"{totals['function_progress']:.0%}" if totals["total_functions"] else "계획 데이터 없음")
         c[3].metric("결함", totals["defects"])
         c = st.columns(3)
         c[0].metric("전체 요구사양서", totals["total_requirements"])
         c[1].metric("완료 요구사양서", totals["completed_requirements"])
-        c[2].metric("요구사양서 진척도", f"{totals['requirement_progress']:.0%}")
+        c[2].metric("요구사양서 진척도", f"{totals['requirement_progress']:.0%}" if totals["total_requirements"] else "계획 데이터 없음")
+        if totals["total_requirements"]:
+            st.progress(min(1.0, max(0.0, totals["requirement_progress"])))
         rows = []
         for item in report["subsystems"]:
             rows.append({"서브시스템": item["subsystem"], "전체 함수": item["total_functions"],
                          "완료 함수": item["completed_functions"], "잔여 함수": item["functions_remaining"],
                          "함수 진척도": f"{item['functions_progress']:.0%}", "전체 요구사양서": item["total_requirements"],
                          "완료 요구사양서": item["completed_requirements"], "잔여 요구사양서": item["requirements_remaining"],
-                         "요구사양서 진척도": f"{item['requirements_progress']:.0%}", "난이도": item["difficulty"]})
+                         "요구사양서 진척도": f"{item['requirements_progress']:.0%}" if item["total_requirements"] else "계획 데이터 없음", "난이도": item["difficulty"]})
         if rows:
             st.write("**서브시스템별 함수·요구사양서 현황**")
-            show_df(pd.DataFrame(rows))
+            for row in rows:
+                st.write(f"**{row['서브시스템']}** · 요구사양서 계획 {row['전체 요구사양서']} · 완료 {row['완료 요구사양서']} · 잔여 {row['잔여 요구사양서']} · {row['요구사양서 진척도']}")
+                if row["전체 요구사양서"]:
+                    st.progress(min(1.0, max(0.0, report["subsystems"][[x["subsystem"] for x in report["subsystems"]].index(row["서브시스템"])]["requirements_progress"])))
+                st.caption(f"함수 별도 실적: 계획 {row['전체 함수']} · 완료 {row['완료 함수']} · 잔여 {row['잔여 함수']} · 진척도 {row['함수 진척도']}")
         if report["members"]:
             st.write("**담당자별 검증 실적**")
             show_df(pd.DataFrame([{"담당자": r["담당자"], "완료 함수": r["completed_functions"],
                 "완료 요구사양서": r["completed_requirements"], "결함": r["defects"], "실행 TC": r["tc_executed"],
                 "생성 TC": r["tc_created"], "수정 TC": r["tc_modified"], "삭제 TC": r["tc_deleted"]}
                 for r in report["members"]]))
-    _render_log_form(project, team, phase, workloads)
-    logs = db.list_version_worklogs(project["id"], phase)
-    if logs:
-        st.write("**등록된 업무 기록**")
-        if phase == "spec":
-            cols = ["date", "member_name", "subsystem", "completed_tasks", "new_requirements",
-                    "modified_requirements", "deleted_requirements", "notes"]
-        else:
-            cols = ["date", "member_name", "subsystem", "completed_requirements", "completed_functions", "defects",
-                    "tc_executed", "tc_created", "tc_modified", "tc_deleted", "notes"]
-        show_df(pd.DataFrame(logs)[cols].rename(columns={"date": "날짜", "member_name": "담당자", "subsystem": "서브시스템", "notes": "특이사항"}))
 
 
-def _render_recommendations(project, team):
-    st.caption("휴가, 현재 업무량, 등록 역량 및 T0070 이하 시트·T0080 이상 내부 버전의 과거 처리 이력을 참고합니다. 추천은 검토용이며 PM 승인 전에는 배정으로 저장하지 않습니다.")
+def _render_recommendations(project, team, allow_approval=True):
+    st.caption("휴가, 현재 업무량, 등록 역량 및 과거 시트·T0800 이상 내부 버전의 처리 이력을 참고합니다. 추천은 검토용이며 PM 승인 전에는 배정으로 저장하지 않습니다.")
+    st.caption("단위 검증 배정 후보: 김재강 · 주해원 · 황지원 · 이혜윤")
     tabs = st.tabs(["요구사양서 작성 배분", "동적 검증 배분"])
     for tab, phase in zip(tabs, ("spec", "verify")):
         with tab:
@@ -293,6 +239,11 @@ def _render_recommendations(project, team):
                     "배정 함수": row["functions"] if phase == "verify" else "-",
                     "배정 요구사양서": row["requirements"] if phase == "verify" else "-",
                     "현재 업무량(%)": row["load"], "남은 가용일": row["available_days"],
+                    "마감 잔여일": ("마감일 미등록" if row.get("deadline_days") is None else
+                                   f"{abs(row['deadline_days'])}일 경과" if row["deadline_days"] < 0 else
+                                   "오늘 마감" if row["deadline_days"] == 0 else f"{row['deadline_days']}일 남음"),
+                    "최근 30일 실적 기록": f"{row.get('recent_worklog_count', 0)}건 · {row.get('recent_worklog_days', 0)}활동일",
+                    "해당 서브시스템 경험": f"{row.get('experience_versions', 0)}개 버전 · {row.get('experience_days', 0)}일",
                     "기존 승인 업무 부담": round(row["reserved_effort"], 1),
                     "예상 부담(난이도·수량)": round(row["effort_score"], 1),
                     "일일 예상 부담": round(row["estimated_daily_effort"], 2) if row["estimated_daily_effort"] is not None else "계산 불가",
@@ -301,7 +252,7 @@ def _render_recommendations(project, team):
             if result["needs_more_staff"]:
                 st.error("과거 처리 이력 기준으로 일부 배정이 처리 능력을 초과합니다. 추가 인력 또는 일정 조정 검토가 필요합니다.")
             elif not result["history_available"]:
-                st.info("T0070 이하 시트 또는 T0080 이상 내부 기록이 쌓이면 담당자별 과거 처리량을 이용해 마감 가능성을 더 정확하게 계산합니다.")
+                st.info("과거 시트 또는 T0800 이상 내부 기록이 쌓이면 담당자별 과거 처리량을 이용해 마감 가능성을 더 정확하게 계산합니다.")
             consent = st.checkbox("추천 요약을 LLM으로 다듬기 (버전·배정 수량·팀원명이 Anthropic API로 전송됨)",
                                   key=f"llm_recommend_consent_{phase}_{project['id']}")
             if consent and st.button("AI 설명 만들기", key=f"llm_recommend_{phase}_{project['id']}"):
@@ -315,31 +266,33 @@ def _render_recommendations(project, team):
                     explanation = llm.rephrase("이 버전의 담당자별 업무 분배 추천 근거를 설명해줘.", answer,
                                                f"버전: {project['version']}\n마감: {result['due']}\n추천 데이터:\n{facts}")
                     st.write(explanation or answer)
-            approved = st.checkbox("추천안을 확인했고 이 배정으로 확정합니다.", key=f"approve_recommend_{phase}_{project['id']}")
-            if st.button("PM 승인 배정 저장", disabled=not approved, key=f"save_assignments_{phase}_{project['id']}"):
-                db.replace_version_assignments(project["id"], phase, result["rows"])
-                st.success("PM 승인 배정을 저장했습니다.")
-                st.rerun()
-            approved_rows = db.list_version_assignments(project["id"], phase)
-            if approved_rows:
-                st.write("**현재 승인된 배정**")
-                show_df(pd.DataFrame([{"담당자": r["member_name"], "서브시스템": r["subsystem"],
-                    "일감": r["allocated_tasks"], "함수": r["allocated_functions"],
-                    "요구사양서": r["allocated_requirements"], "마감 가능성": r["feasibility"],
-                    "승인 시각": r["approved_at"]} for r in approved_rows]))
+            if allow_approval:
+                approved = st.checkbox("추천안을 확인했고 이 배정으로 확정합니다.", key=f"approve_recommend_{phase}_{project['id']}")
+                if st.button("PM 승인 배정 저장", disabled=not approved, key=f"save_assignments_{phase}_{project['id']}"):
+                    db.replace_version_assignments(project["id"], phase, result["rows"])
+                    st.cache_data.clear()
+                    st.success("PM 승인 배정을 저장했습니다.")
+                    st.rerun()
+                approved_rows = db.list_version_assignments(project["id"], phase)
+                if approved_rows:
+                    st.write("**현재 승인된 배정**")
+                    show_df(pd.DataFrame([{"담당자": r["member_name"], "서브시스템": r["subsystem"],
+                        "일감": r["allocated_tasks"], "함수": r["allocated_functions"],
+                        "요구사양서": r["allocated_requirements"], "마감 가능성": r["feasibility"],
+                        "승인 시각": r["approved_at"]} for r in approved_rows]))
 
 
 def render(team, rules=None):
-    header("🧭 내부 버전 업무 관리", "T0080 이상은 VACON 내부 DB에서 업무량과 실적을 버전·서브시스템별로 관리합니다.")
+    header("🗓️ (PM) 검증 일정 관리", "PM이 버전별 요구사양서 작성·동적 검증 목표와 마감일을 관리합니다. 실제 기록은 검증 업무 기록에서 입력합니다.")
     _create_version_form()
-    projects = internal_projects()
+    projects = [p for p in db.list_version_projects() if is_internal_version(p["version"])]
     if not projects:
-        st.info("내부 관리 버전이 없습니다. T0080 이상 버전을 생성하세요. T0070 이하는 기존 시트 연동 화면에 남아 있습니다.")
+        st.info("등록된 버전이 없습니다. 새 버전을 생성하세요.")
         return
     by_id = {int(p["id"]): p for p in projects}
     selected_id = st.selectbox("버전", list(by_id), format_func=lambda pid: by_id[pid]["version"], key="internal_version_pick")
     project = db.get_version_project(selected_id)
-    st.subheader(f"{project['version']} · 내부 DB")
+    st.subheader(f"{project['version']} · VACON 계획")
     st.caption("요구사양서 작성 일감과 동적 검증 함수·요구사양서 목표 및 실적은 서로 다른 테이블에서 관리됩니다.")
     st.caption(f"요구사양서 작성 전체 일감: {project['spec_total_items']} · 동적 검증 등록 전체 요구사양서: {project['verify_spec_total_items']}")
     split_history = [h for h in db.version_project_history(project["id"])
@@ -352,12 +305,10 @@ def render(team, rules=None):
             st.switch_page(WORKLOG_PAGE)
         st.button("선택 버전의 전체 업무 로그 보기 →", key=f"internal_worklog_link_{selected_id}",
                   on_click=open_worklog, args=(project["version"],))
-    tabs = st.tabs(["일정 및 사전 물량", "요구사양서 작성", "동적 검증", "AI 업무 분배"])
+    tabs = st.tabs(["일정 및 사전 물량", "요구사양서 작성", "동적 검증"])
     with tabs[0]:
         _schedule_and_workload(project)
     with tabs[1]:
         _render_phase(project, team, "spec")
     with tabs[2]:
         _render_phase(project, team, "verify")
-    with tabs[3]:
-        _render_recommendations(project, team)

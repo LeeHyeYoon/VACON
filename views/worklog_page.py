@@ -1,194 +1,198 @@
+"""검증 업무 로그. 모든 원천을 읽기 전용으로 보여준다."""
 from datetime import timedelta
-
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-
 from data import db
-from services import worklog as wl
-from services.models import today
 from services.internal_projects import is_internal_version
-from views.common import fmt_date, fmt_leave, header, show_df
+from services.models import today
+from views.common import header, show_df
 
 
-def _render_internal_logs(project, team):
-    st.caption("이 버전은 VACON 내부 DB를 사용합니다. 요구사양서 작성과 동적 검증 기록은 별도 테이블에서 조회합니다.")
-    spec_logs = db.list_version_worklogs(project["id"], "spec")
-    verify_logs = db.list_version_worklogs(project["id"], "verify")
-    subsystem_names = sorted({row["subsystem"] for row in [*spec_logs, *verify_logs]}, key=str.casefold)
-    options = ["(전체)", *subsystem_names]
-    subsystem = st.selectbox("서브시스템", options, key=f"internal_worklog_subsystem_{project['id']}")
-    tabs = st.tabs(["요구사양서 작성 기록", "동적 검증 기록"])
-    fields = {
-        "spec": ["date", "member_name", "subsystem", "completed_tasks", "new_requirements", "modified_requirements", "deleted_requirements", "notes"],
-        "verify": ["date", "member_name", "subsystem", "completed_requirements", "completed_functions", "defects", "tc_executed", "tc_created", "tc_modified", "tc_deleted", "notes"],
-    }
-    labels = {"date": "날짜", "member_name": "담당자", "subsystem": "서브시스템", "completed_tasks": "완료 일감",
-              "new_requirements": "신규 요구사양", "modified_requirements": "수정 요구사양", "deleted_requirements": "삭제 요구사양",
-              "completed_requirements": "완료 요구사양서", "completed_functions": "완료 함수", "defects": "결함",
-              "tc_executed": "실행 TC", "tc_created": "생성 TC", "tc_modified": "수정 TC", "tc_deleted": "삭제 TC", "notes": "특이사항"}
-    for tab, phase, rows in zip(tabs, ("spec", "verify"), (spec_logs, verify_logs)):
-        with tab:
-            filtered = [row for row in rows if subsystem == "(전체)" or row["subsystem"] == subsystem]
-            if not filtered:
-                st.info("선택한 버전·서브시스템에 등록된 업무 기록이 없습니다.")
+def _show_metric_table(frame, group_fields, metric_fields):
+    table = frame.groupby(group_fields, as_index=False)[metric_fields].sum(min_count=1)
+    def display(value):
+        if pd.isna(value): return "데이터 없음"
+        try:
+            return str(int(value)) if float(value).is_integer() else str(value)
+        except (TypeError, ValueError):
+            return str(value)
+    for field in metric_fields: table[field] = table[field].map(display)
+    show_df(table)
+
+
+def _records(team):
+    rows = []
+    imported = team.logs[team.logs["source"].astype(str) != "샘플"] if len(team.logs) else team.logs
+    for r in imported.to_dict("records") if len(imported) else []:
+        req_phase = r.get("track") == "req"
+        rows.append({"날짜": r.get("date"), "담당자": team.name(r.get("member_id")), "버전": str(r.get("version") or "").strip() or "(버전 미입력)",
+            "서브시스템": str(r.get("subsystem") or "").strip() or "서브시스템 미입력", "업무 유형": "요구사양서 작성" if req_phase else "동적 검증",
+            "완료 일감": r.get("issue") if req_phase else None, "신규 요구사양": r.get("new_req") if req_phase else None,
+            "수정 요구사양": r.get("modified_req") if req_phase else None, "삭제 요구사양": r.get("deleted_req") if req_phase else None,
+            "완료 요구사양서": r.get("req") if not req_phase else None, "완료 함수": r.get("func"), "결함": r.get("defect"),
+            "실행 TC": r.get("tc"), "생성 TC": r.get("tc_created"), "수정 TC": r.get("tc_modified"), "삭제 TC": r.get("tc_deleted"),
+            "특이사항": r.get("notes") or "", "출처": r.get("source", "Google Sheets")})
+    for phase in ("spec", "verify"):
+        for r in db.list_all_internal_worklogs(phase):
+            if not is_internal_version(r["version"]):
                 continue
-            st.metric("기록 건수", len(filtered))
-            show_df(pd.DataFrame(filtered)[fields[phase]].rename(columns=labels))
-    if len(team.logs):
-        legacy = team.logs[team.logs["version"].fillna("").astype(str).str.strip().str.casefold()
-                           == project["version"].strip().casefold()]
-        if not legacy.empty:
-            with st.expander("기존 Google Sheets 자료 (내부 진척도와 별도 보관)"):
-                st.warning("이 자료는 이전 연동 기록입니다. T0080 이상 내부 진척도와 합산하지 않습니다.")
-                archived = legacy[[c for c in ("date", "source", "track", "member_id", "subsystem", "req", "func", "tc", "issue")
-                                   if c in legacy]].copy()
-                archived["담당자"] = archived["member_id"].map(team.name)
-                show_df(archived)
+            out = {"날짜": r["date"], "담당자": r["member_name"], "버전": r["version"], "서브시스템": r["subsystem"],
+                   "업무 유형": "요구사양서 작성" if phase=="spec" else "동적 검증", "완료 일감": 0, "신규 요구사양": 0, "수정 요구사양": 0, "삭제 요구사양": 0,
+                   "완료 요구사양서": 0, "완료 함수": 0, "결함": 0, "실행 TC": 0, "생성 TC": 0, "수정 TC": 0, "삭제 TC": 0,
+                   "특이사항": r.get("notes", ""), "출처": "VACON DB"}
+            if phase=="spec":
+                for key,field in (("완료 일감","completed_tasks"),("신규 요구사양","new_requirements"),("수정 요구사양","modified_requirements"),("삭제 요구사양","deleted_requirements")): out[key]=r[field]
+            else:
+                for key,field in (("완료 요구사양서","completed_requirements"),("완료 함수","completed_functions"),("결함","defects"),("실행 TC","tc_executed"),("생성 TC","tc_created"),("수정 TC","tc_modified"),("삭제 TC","tc_deleted")): out[key]=r[field]
+            rows.append(out)
+    return pd.DataFrame(rows)
 
 
-def render(team, rules):
-    header("📈 업무 로그", "버전을 선택하면 해당 버전의 전체 동적검증·요구사양서 로그와 휴가 영향을 집계합니다.")
-    t = today()
-    pool = team.unit_pool()
-    projects = db.list_version_projects()
-    versions = {str(v).strip() for v in team.logs.get("version", pd.Series(dtype=str)).dropna() if str(v).strip()}
-    versions.update(p["version"] for p in projects)
-    if len(team.logs) and (team.logs["version"].isna() | (team.logs["version"].astype(str).str.strip() == "")).any():
-        versions.add("(버전 미입력)")
-    version_options = sorted(versions,
-                             key=lambda value: (value != "(버전 미입력)", wl.version_sort_key(value)),
-                             reverse=True)
-    if not version_options:
-        st.info("버전별 로그가 없습니다. '버전별 동적검증'에서 버전을 등록하거나 '데이터 관리 > 시트 연동'에서 버전 열이 포함된 로그 탭을 연결하세요.")
-        return
-    preferred = st.session_state.pop("worklog_version", None)
-    widget_key = "worklog_version_selector"
-    if st.session_state.get(widget_key) not in version_options:
-        if preferred in version_options:
-            st.session_state[widget_key] = preferred
+def render(team, rules=None):
+    header("📈 검증 업무 로그", "과거 Google Sheets와 VACON 내부 업무 기록을 통합 조회합니다. 이 화면은 조회 전용입니다.")
+    frame = _records(team)
+    if frame.empty: st.info("실제 시트 또는 VACON 내부 DB 업무 기록이 없습니다. 샘플 데이터는 업무 로그에서 제외합니다. 데이터 관리의 시트 연동에서 시트 로그를 반영하세요."); return
+    st.markdown("""
+    <style>
+    div[data-testid="stSegmentedControl"] { background: rgba(38, 92, 87, .08); border: 1px solid rgba(38, 92, 87, .18); padding: 5px; border-radius: 15px; }
+    div[data-testid="stSegmentedControl"] button { min-height: 44px; border-radius: 11px; font-weight: 650; transition: all .16s ease; }
+    div[data-testid="stSegmentedControl"] button[aria-pressed="true"] { background: linear-gradient(135deg, #397c72, #24534f); color: white; box-shadow: 0 3px 10px rgba(31, 75, 70, .22); }
+    </style>
+    """, unsafe_allow_html=True)
+    with st.container(border=True):
+        st.markdown("**업무 유형**")
+        st.caption("확인할 업무 영역을 선택하세요. 작성과 검증 기록은 각각 따로 집계됩니다.")
+        selected_phase = st.segmented_control(
+            "업무 유형 선택", ["요구사양서 작성", "동적 검증"],
+            format_func=lambda value: "📝  요구사양서 작성" if value == "요구사양서 작성" else "🧪  동적 검증",
+            selection_mode="single", default="요구사양서 작성", key="worklog_phase",
+            label_visibility="collapsed", width="stretch") or "요구사양서 작성"
+    frame = frame[frame["업무 유형"] == selected_phase].copy()
+    phase_history = frame.copy()
+    versions = sorted(frame["버전"].dropna().unique(), key=lambda x: (x!="(버전 미입력)", str(x).casefold()), reverse=True)
+    people = sorted(frame["담당자"].dropna().unique()); subs = sorted(frame["서브시스템"].dropna().unique())
+    today_date=today(); monday=today_date-timedelta(days=today_date.weekday())
+    preset = st.session_state.get("worklog_version")
+    version_options = ["(전체)",*versions]
+    version_index = version_options.index(preset) if preset in version_options else 0
+    c=st.columns(3); version=c[0].selectbox("버전", version_options, index=version_index, key="worklog_version_filter"); person=c[1].selectbox("담당자", ["(전체)",*people], key="worklog_person_filter"); subsystem=c[2].selectbox("서브시스템", ["(전체)",*subs], key="worklog_subsystem_filter")
+    if version!="(전체)": frame=frame[frame["버전"]==version]
+    if person!="(전체)": frame=frame[frame["담당자"]==person]
+    if subsystem!="(전체)": frame=frame[frame["서브시스템"]==subsystem]
+    period=st.selectbox("기간", ["전체 기간", "이번 주", "이번 달", "지난달", "직접 기간 설정"], key="worklog_period")
+    start=end=None
+    if period=="이번 주": start,end=monday,today_date
+    elif period=="이번 달": start,end=today_date.replace(day=1),today_date
+    elif period=="지난달":
+        end=today_date.replace(day=1)-timedelta(days=1); start=end.replace(day=1)
+    elif period=="직접 기간 설정":
+        rng=st.date_input("조회 기간", value=(today_date-timedelta(days=30),today_date), key="worklog_custom_range")
+        if isinstance(rng,(tuple,list)) and len(rng)==2: start,end=rng
+    if start and end: frame=frame[frame["날짜"].between(start,end)]
+    frame=frame.sort_values("날짜",ascending=False)
+    phase_history = phase_history[phase_history["출처"] != "샘플"]
+    selected_version_history = phase_history if version == "(전체)" else phase_history[phase_history["버전"] == version]
+    if person != "(전체)": selected_version_history = selected_version_history[selected_version_history["담당자"] == person]
+    if subsystem != "(전체)": selected_version_history = selected_version_history[selected_version_history["서브시스템"] == subsystem]
+    if version != "(전체)":
+        project = next((p for p in db.list_version_projects() if p["version"].casefold() == version.casefold()), None)
+        if project and is_internal_version(version):
+            st.subheader(f"{version} 마감 일정")
+            due_cols = st.columns(2)
+            for col, phase_key, label in ((due_cols[0], "spec_due", "요구사양서 작성"), (due_cols[1], "verify_due", "동적 검증")):
+                due = project.get(phase_key)
+                if due is None: msg = "마감일 미등록"
+                elif due < today_date: msg = f"마감일이 지났습니다 · {(today_date-due).days}일 경과"
+                elif due == today_date: msg = "오늘 마감"
+                else: msg = f"마감까지 {(due-today_date).days}일 남았습니다"
+                col.metric(label, msg)
+        elif not is_internal_version(version):
+            st.info("과거 Google Sheets 버전에는 VACON 계획 마감일이 없어 계획 대비 진척률을 산출하지 않습니다.")
+    tabs=st.tabs(["업무 현황","담당자별 현황","서브시스템별 현황","경험·숙련도 분석","전체 업무 기록"])
+    with tabs[0]:
+        if version != "(전체)":
+            project = next((p for p in db.list_version_projects() if p["version"].casefold() == version.casefold()), None)
+            if project:
+                internal_phase = "spec" if selected_phase == "요구사양서 작성" else "verify"
+                workloads = db.list_version_workloads(project["id"], internal_phase)
+                logs = db.list_version_worklogs(project["id"], internal_phase)
+                if internal_phase == "spec":
+                    total = sum(int(w["total_tasks"]) for w in workloads); done = sum(int(r["completed_tasks"]) for r in logs)
+                    st.subheader(f"{version} · 요구사양서 작성 계획 대비 실적")
+                    c = st.columns(4); c[0].metric("전체 계획 일감", total if total else "계획 데이터 없음"); c[1].metric("완료 일감", done); c[2].metric("잔여 일감", max(0,total-done) if total else "계획 데이터 없음"); c[3].metric("전체 진척률", f"{min(1,done/total):.0%}" if total else "계획 데이터 없음")
+                    if total: st.progress(min(1.0,max(0.0,done/total)))
+                    for w in workloads:
+                        sub_done=sum(int(r["completed_tasks"]) for r in logs if r["subsystem"]==w["subsystem"]); sub_total=int(w["total_tasks"])
+                        st.write(f"**{w['subsystem']}** · 계획 {sub_total} · 완료 {sub_done} · 잔여 {max(0,sub_total-sub_done)} · {min(1,sub_done/sub_total):.0%}" if sub_total else f"**{w['subsystem']}** · 계획 데이터 없음 · 완료 {sub_done}")
+                        if sub_total: st.progress(min(1.0,max(0.0,sub_done/sub_total)))
+                else:
+                    total = sum(int(w["total_requirements"]) for w in workloads); done = sum(int(r["completed_requirements"]) for r in logs)
+                    funcs = sum(int(w["total_functions"]) for w in workloads); func_done=sum(int(r["completed_functions"]) for r in logs)
+                    st.subheader(f"{version} · 동적 검증 계획 대비 실적")
+                    c = st.columns(4); c[0].metric("검증 대상 요구사양서", total if total else "계획 데이터 없음"); c[1].metric("완료 요구사양서", done); c[2].metric("잔여 요구사양서", max(0,total-done) if total else "계획 데이터 없음"); c[3].metric("검증 진척률", f"{min(1,done/total):.0%}" if total else "계획 데이터 없음")
+                    if total: st.progress(min(1.0,max(0.0,done/total)))
+                    st.caption(f"완료 함수는 별도 지표입니다: 계획 {funcs if funcs else '계획 데이터 없음'} · 완료 {func_done}")
+                    for w in workloads:
+                        sub_done=sum(int(r["completed_requirements"]) for r in logs if r["subsystem"]==w["subsystem"]); sub_total=int(w["total_requirements"])
+                        st.write(f"**{w['subsystem']}** · 계획 {sub_total} · 완료 {sub_done} · 잔여 {max(0,sub_total-sub_done)} · {min(1,sub_done/sub_total):.0%}" if sub_total else f"**{w['subsystem']}** · 계획 데이터 없음 · 완료 {sub_done}")
+                        if sub_total: st.progress(min(1.0,max(0.0,sub_done/sub_total)))
+            else:
+                st.info("과거 Google Sheets 버전은 PM 계획 없이 실적만 조회합니다. 계획 대비 진척률 데이터는 없습니다.")
+        elif version == "(전체)":
+            st.info("버전을 선택하면 해당 버전의 계획 대비 실적과 마감일을 확인할 수 있습니다. 계획이 없는 과거 버전은 실제 기록과 계획 진척률을 구분해 표시합니다.")
+        part=frame
+        metrics=["완료 일감","신규 요구사양","수정 요구사양","삭제 요구사양"] if selected_phase=="요구사양서 작성" else ["완료 요구사양서","완료 함수","결함","실행 TC","생성 TC","수정 TC","삭제 TC"]
+        if not part.empty: _show_metric_table(part, ["버전", "서브시스템"], metrics)
+    with tabs[1]:
+        if not frame.empty: _show_metric_table(frame, ["담당자","버전","서브시스템","업무 유형"], ["완료 일감","신규 요구사양","수정 요구사양","삭제 요구사양","완료 요구사양서","완료 함수","결함","실행 TC","생성 TC","수정 TC","삭제 TC"])
+        st.caption("건수, 담당 범위, 난이도, 결함·품질 지표는 별도 지표입니다. 단순 처리량으로 개인의 업무 능력을 판단하지 마세요.")
+    with tabs[2]:
+        if not frame.empty: _show_metric_table(frame, ["서브시스템","담당자","버전","업무 유형"], ["완료 일감","신규 요구사양","수정 요구사양","삭제 요구사양","완료 요구사양서","완료 함수","결함","실행 TC","생성 TC","수정 TC","삭제 TC"])
+    with tabs[3]:
+        history = phase_history
+        if history.empty:
+            st.info("실제 Google Sheets 또는 VACON 내부 DB 업무 기록이 없어 숙련도를 평가할 수 없습니다.")
         else:
-            st.session_state.pop(widget_key, None)
-    c = st.columns(2)
-    selected_version = c[0].selectbox("버전", version_options, key=widget_key,
-                                     help="업무 로그는 선택한 버전에 한정해 집계합니다.")
-    selected_project = next((p for p in projects if p["version"].casefold() == selected_version.casefold()), None)
-    if is_internal_version(selected_version):
-        if selected_project:
-            _render_internal_logs(selected_project, team)
-        else:
-            st.info(f"{selected_version}은 내부 DB 관리 대상이지만 버전 등록이 없습니다. '내부 버전 업무'에서 생성하세요.")
-        return
-    st.caption("단위 테스트 인원: " + (", ".join(team.name(m) for m in sorted(pool)) or "없음(데이터 관리 > 팀원·역량에서 '단위테스트' 역량 지정)")
-               + " · 단위 테스트 업무는 이 인원만 수행할 수 있습니다.")
-    if selected_project:
-        st.caption(f"버전 일정 연결: 사양서 {selected_project['spec_start'] or '미설정'} ~ {selected_project['spec_due'] or '미설정'} · "
-                   f"동적검증 {selected_project['verify_start'] or '미설정'} ~ {selected_project['verify_due'] or '미설정'}")
-    normalized_log_versions = team.logs["version"].fillna("").astype(str).str.strip().str.casefold()
-    version_log_mask = (normalized_log_versions == selected_version.strip().casefold()
-                        if selected_version != "(버전 미입력)" else
-                        (normalized_log_versions == ""))
-    version_logs = team.logs[version_log_mask] if len(team.logs) else team.logs
-    normalized_subsystems = version_logs.get("subsystem", pd.Series(index=version_logs.index, dtype=str)).fillna("").astype(str).str.strip()
-    if not version_logs.empty and not normalized_subsystems.any():
-        st.caption("서브시스템 값이 아직 없습니다. 데이터 관리 > 시트 연동에서 서브시스템 열을 지정한 뒤 로그를 다시 가져오세요.")
-    subsystem_values = sorted({v for v in normalized_subsystems if v}, key=str.casefold)
-    subsystem_options = ["(전체)", *subsystem_values]
-    if (normalized_subsystems == "").any():
-        subsystem_options.append("(서브시스템 미입력)")
-    selected_subsystem = c[1].selectbox("서브시스템", subsystem_options,
-                                        help="해당 버전의 전체 로그 또는 서브시스템 하나만 집계합니다.")
-    if selected_subsystem == "(전체)":
-        scoped_logs = version_logs
-        subsystem_filter = None
-    elif selected_subsystem == "(서브시스템 미입력)":
-        scoped_logs = version_logs[normalized_subsystems == ""]
-        subsystem_filter = ""
-    else:
-        scoped_logs = version_logs[normalized_subsystems.str.casefold() == selected_subsystem.casefold()]
-        subsystem_filter = selected_subsystem
-    if not scoped_logs.empty:
-        p_start, p_end = scoped_logs["date"].min(), scoped_logs["date"].max()
-        st.caption(f"집계 대상: {selected_version} · 등록된 전체 로그 ({p_start} ~ {p_end})")
-    else:
-        p_start = p_end = t
-        st.caption(f"집계 대상: {selected_version} · 등록된 전체 로그")
-    if scoped_logs.empty:
-        st.info(f"{selected_version}에 연결된 로그가 없습니다. 해당 버전이 표시된 CSV 로그를 동기화하면 여기에 집계됩니다.")
-    else:
-        src = scoped_logs.groupby("source").agg(기록=("id", "count"), 시작=("date", "min"), 종료=("date", "max")).reset_index()
-        show_df(src.rename(columns={"source": "출처"}))
-        if (src["source"] == "샘플").any():
-            st.warning("선택한 버전에 '샘플(가상)' 로그가 포함되어 있습니다. 실제 시트를 동기화하면 샘플 로그를 삭제할 수 있습니다.")
-            if st.button("샘플 로그 삭제"):
-                db.delete_logs("샘플")
-                st.rerun()
-
-    st.caption(f"기록 기간 내 근무일 {len(wl.workdays(p_start, p_end))}일")
-    tab1, tab2, tab3 = st.tabs(["처리량", "휴가 영향 예측", "인력 가용 현황"])
-
-    with tab1:
-        tbl = wl.throughput_table(team, p_start, p_end, rules, selected_version if selected_version != "(버전 미입력)" else "",
-                                  subsystem_filter)
-        for track, name in wl.TRACKS.items():
-            st.subheader(name)
-            sub = tbl[tbl["업무"] == name].dropna(axis=1, how="all").drop(columns="업무")
-            show_df(sub)
-            recs = [r for r in scoped_logs.to_dict("records") if r["track"] == track]
-            if recs:
-                df = pd.DataFrame(recs)
-                df["팀원"] = df["member_id"].map(team.name)
-                m = wl.METRIC_COLS[track][0]
-                daily = df.groupby(["date", "팀원"])[m].sum().reset_index()
-                fig = px.bar(daily, x="date", y=m, color="팀원", labels={"date": "", m: wl.METRIC_LABELS[m]})
-                fig.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10))
-                st.plotly_chart(fig)
-        st.caption("일평균은 근무일(주말·종일 휴가 제외) 기준이며, 기록이 없는 근무일은 0건으로 계산합니다. 기록 자체가 없는 경우는 '-'로 표시합니다.")
-
-    with tab2:
-        leaves = sorted([lv for lv in team.leave_records() if lv["member_id"] in pool and lv["end"] >= t], key=lambda lv: lv["start"])
-        if not leaves:
-            st.info("오늘 이후 예정된 단위 테스트 인원의 휴가가 없습니다.")
-        else:
-            by_id = {lv["id"]: lv for lv in leaves}
-            lid = st.selectbox("휴가 선택", list(by_id), format_func=lambda i: fmt_leave(team, by_id[i]))
-            lv = by_id[lid]
-            res = wl.leave_impact(team, lv["member_id"], lv["start"], lv["end"], t, rules=rules, base_start=p_start, base_end=p_end,
-                                  version=selected_version if selected_version != "(버전 미입력)" else "",
-                                  subsystem=subsystem_filter)
-            st.write(f"**{res['name']}** 님 휴가 근무일 **{res['lost_days']}일** — **{selected_version} · {selected_subsystem}** 로그 기준 일평균으로 예상 처리 공백과 분담 시 부담을 계산합니다.")
-            if res["pool_overlap_days"]:
-                st.warning("단위 테스트 인원 다수가 함께 부재인 날: " + ", ".join(fmt_date(d) for d in res["pool_overlap_days"]))
-            for it in res["items"]:
-                with st.expander(it["label"], expanded=True):
-                    if it["gap"] is None:
-                        for w in it["warnings"]:
-                            st.warning(w)
-                        continue
-                    c = st.columns(2)
-                    c[0].metric("평소 일평균", f"{it['avg']:.1f}")
-                    c[1].metric("휴가 중 예상 처리 공백", f"약 {it['gap']:.0f}")
-                    if it["rows"]:
-                        show_df(pd.DataFrame(it["rows"]).drop(columns="pct"))
-                    for w in it["warnings"]:
-                        st.warning(w)
-                    for e in it["excluded"]:
-                        st.caption("제외: " + e)
-            st.caption("예측은 과거 평균에 근거한 참고값입니다. 마감 달성 가능 여부는 남은 물량 정보가 있어야 판단할 수 있습니다.")
-
-    with tab3:
-        a_rng = st.date_input("확인할 기간", value=(t, t + timedelta(days=27)), key="wl_avail_range")
-        if not isinstance(a_rng, (tuple, list)) or len(a_rng) != 2:
-            st.info("시작일과 종료일을 모두 선택하세요.")
-            return
-        av = wl.pool_availability(team, a_rng[0], a_rng[1], rules)
-        if av.empty:
-            st.info("표시할 근무일이 없습니다.")
-        else:
-            fig = px.bar(av.assign(날짜표시=[fmt_date(d) for d in av["날짜"]]), x="날짜표시", y="가용", hover_data=["부재자"],
-                         labels={"날짜표시": "", "가용": "가용 인원(명)"})
-            fig.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(fig)
-            low = av[av["가용"] < av["전체"]]
-            if len(low):
-                show_df(low.rename(columns={"부재자": "부재 인원"}))
+            rows = []
+            pairs = selected_version_history[["담당자", "서브시스템"]].drop_duplicates().itertuples(index=False, name=None)
+            phase_metrics = (["완료 일감", "신규 요구사양", "수정 요구사양", "삭제 요구사양"] if selected_phase == "요구사양서 작성" else
+                             ["완료 요구사양서", "완료 함수", "결함", "실행 TC", "생성 TC", "수정 TC", "삭제 TC"])
+            for member, subsystem_name in pairs:
+                part = history[(history["담당자"] == member) & (history["서브시스템"] == subsystem_name)]
+                versions_seen = sorted({str(v) for v in part["버전"] if v and v != "(버전 미입력)"}, key=str.casefold)
+                dated = part[part["날짜"].notna()]
+                metric_breadth = sum(bool(pd.to_numeric(part[m], errors="coerce").fillna(0).gt(0).any()) for m in phase_metrics)
+                if len(dated) < 3 or len(versions_seen) < 2:
+                    level = "평가 데이터 부족"
+                    basis = f"날짜 있는 기록 {len(dated)}건, 참여 버전 {len(versions_seen)}개; 숙련도 최소 기준(기록 3건·버전 2개)에 미달"
+                elif len(dated) >= 8 and len(versions_seen) >= 3 and metric_breadth >= 2:
+                    level = "반복·다양 경험"
+                    basis = f"{selected_phase} 날짜 있는 기록 {len(dated)}건, 참여 버전 {len(versions_seen)}개, 활동일 {dated['날짜'].nunique()}일, 실적 유형 {metric_breadth}종"
+                else:
+                    level = "업무 경험 확인"
+                    basis = f"{selected_phase} 날짜 있는 기록 {len(dated)}건, 참여 버전 {len(versions_seen)}개, 활동일 {dated['날짜'].nunique()}일, 실적 유형 {metric_breadth}종"
+                def total(column):
+                    values = pd.to_numeric(part[column], errors="coerce")
+                    return values.sum(min_count=1)
+                row = {"담당자": member, "서브시스템": subsystem_name, "참여 버전": ", ".join(versions_seen) or "버전 미입력",
+                       "참여 버전 수": len(versions_seen), "업무 기록 건수": len(part), "활동일 수": int(dated["날짜"].nunique()),
+                       "실적 유형 수": metric_breadth,
+                       "숙련도": level, "평가 근거": basis}
+                row.update({metric: total(metric) for metric in phase_metrics})
+                rows.append(row)
+            report = pd.DataFrame(rows)
+            if not report.empty:
+                chart = report.assign(담당_영역=report["담당자"] + " · " + report["서브시스템"])
+                fig = px.scatter(chart, x="참여 버전 수", y="담당_영역", size="활동일 수", color="숙련도",
+                                 hover_data=["참여 버전", "업무 기록 건수", "평가 근거"],
+                                 title=f"{selected_phase} 경험 범위 · 참여 버전과 반복 활동일")
+                fig.update_layout(xaxis_title="해당 서브시스템 참여 버전 수", yaxis_title="담당자 · 서브시스템")
+                st.plotly_chart(fig, use_container_width=True)
+            metric_columns = [c for c in report if c in phase_metrics]
+            for column in metric_columns:
+                report[column] = report[column].map(lambda value: "데이터 없음" if pd.isna(value) else str(int(value)) if float(value).is_integer() else str(value))
+            show_df(report)
+            st.caption(f"숙련도는 선택한 업무 유형의 실제 기록·활동일·참여 버전·실적 항목 다양성으로 분류한 경험 참고값이며 점수는 없습니다. 업무 건수나 결함 수만으로 능력을 판단하지 않습니다. 기준: 날짜 있는 기록 3건 또는 참여 버전 2개 미만은 평가 데이터 부족; 기록 8건 이상·버전 3개 이상·실적 유형 2종 이상이면 반복·다양 경험으로 표시합니다.")
+    with tabs[4]:
+        show_df(frame.fillna("데이터 없음").astype(str))
