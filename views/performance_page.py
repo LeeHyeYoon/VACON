@@ -4,6 +4,7 @@ import pandas as pd
 import streamlit as st
 from data import db
 from services.internal_projects import is_internal_version, recommend_subsystem
+from services.coverage import workflow_stage
 from services.models import today
 from views.common import header, show_df
 from views.internal_work_page import _render_recommendations
@@ -32,6 +33,17 @@ def _phase(project, team, phase):
     workloads = db.list_version_workloads(project["id"], phase); records = db.list_version_worklogs(project["id"], phase)
     if not workloads:
         st.info("이 버전에 등록된 서브시스템이 없습니다. (PM) 검증 일정 관리에서 먼저 계획을 등록하세요."); return
+    if phase == "verify":
+        workflow = workflow_stage(db.get_version_project(project["id"]))
+        if workflow["stage"] != "verify_work":
+            if workflow["stage"] in ("spec_plan", "spec_work"):
+                next_step = "요구사양서 작성 목표를 모두 완료하면 동적 검증 실적 입력이 열립니다."
+            elif workflow["stage"] == "verify_plan":
+                next_step = "(PM) 검증 일정 관리에서 서브시스템별 동적 검증 목표를 등록하세요."
+            else:
+                next_step = "현재 등록된 동적 검증 목표는 모두 완료되었습니다."
+            st.info(workflow["message"] + " · " + next_step)
+            return
     action = st.radio("기록 작업", ["신규 기록", "기록 수정/삭제"], horizontal=True, key=f"perf_action_{phase}_{project['id']}")
     selected = None
     if action == "기록 수정/삭제":

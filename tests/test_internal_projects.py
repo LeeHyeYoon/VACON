@@ -90,6 +90,12 @@ class InternalProjectTests(unittest.TestCase):
         spec_id = db.save_version_worklog(self.project_id, "spec", {"date": date(2026, 11, 2),
             "member_id": self.member, "subsystem": "Audio", "completed_tasks": 3,
             "new_requirements": 5, "modified_requirements": 2}, path=self.path)
+        db.save_version_worklog(self.project_id, "spec", {"date": date(2026, 11, 2),
+            "member_id": self.member, "subsystem": "Audio", "completed_tasks": 7}, path=self.path)
+        db.set_version_workflow_status(self.project_id, "spec_review_status", "완료", self.path)
+        db.set_version_workflow_status(self.project_id, "verification_targets_confirmed", True, self.path)
+        db.replace_version_assignments(self.project_id, "verify", [{"subsystem": "Audio", "member_id": self.member,
+            "functions": 20, "requirements": 15}], self.path)
         verify_id = db.save_version_worklog(self.project_id, "verify", {"date": date(2026, 11, 2),
             "member_id": self.member, "subsystem": "Audio", "completed_functions": 4,
             "completed_requirements": 6, "defects": 1, "tc_executed": 12}, path=self.path)
@@ -99,12 +105,12 @@ class InternalProjectTests(unittest.TestCase):
         verify = dashboard(db.get_version_project(self.project_id, self.path), "verify",
                             db.list_version_workloads(self.project_id, "verify", self.path),
                             db.list_version_worklogs(self.project_id, "verify", self.path), date(2026, 11, 2))
-        self.assertEqual((spec["totals"]["completed_tasks"], spec["totals"]["progress"]), (3, 0.3))
+        self.assertEqual((spec["totals"]["completed_tasks"], spec["totals"]["progress"]), (10, 1.0))
         self.assertEqual((verify["totals"]["completed_functions"], verify["totals"]["completed_requirements"]), (4, 6))
+        db.delete_version_worklog(self.project_id, "verify", verify_id, path=self.path)
         db.save_version_worklog(self.project_id, "spec", {"date": date(2026, 11, 3),
             "member_id": self.member, "subsystem": "Audio", "completed_tasks": 8,
             "new_requirements": 5}, log_id=spec_id, path=self.path)
-        db.delete_version_worklog(self.project_id, "verify", verify_id, path=self.path)
         self.assertEqual(db.list_version_worklogs(self.project_id, "spec", self.path)[0]["completed_tasks"], 8)
         self.assertEqual(db.list_version_worklogs(self.project_id, "verify", self.path), [])
 
@@ -151,8 +157,13 @@ class InternalProjectTests(unittest.TestCase):
         self.assertEqual((record["version"], record["func"]), ("T0700", 5))
 
     def test_recommendation_uses_workload_leaves_and_approved_assignments(self):
+        db.save_version_workload(self.project_id, "spec", "Spec", total_tasks=1, path=self.path)
+        db.save_version_worklog(self.project_id, "spec", {"date": date(2026, 11, 1),
+            "member_id": self.member, "subsystem": "Spec", "completed_tasks": 1}, path=self.path)
         db.save_version_workload(self.project_id, "verify", "Audio", total_functions=18,
                                  total_requirements=9, difficulty=3, path=self.path)
+        db.set_version_workflow_status(self.project_id, "spec_review_status", "완료", self.path)
+        db.set_version_workflow_status(self.project_id, "verification_targets_confirmed", True, self.path)
         db.add_leave(self.member, date(2026, 11, 3), date(2026, 11, 3), "연차", path=self.path)
         team = db.load_team_data(self.path)
         result = recommend_distribution(team, db.get_version_project(self.project_id, self.path), "verify",
@@ -171,6 +182,12 @@ class InternalProjectTests(unittest.TestCase):
         second = db.add_member("황지원", "QA", 20, path=self.path)
         db.set_skill(second, "단위테스트", 2, path=self.path)
         prior_project_id = self.create("T0900")
+        db.save_version_workload(prior_project_id, "spec", "Spec", total_tasks=1, path=self.path)
+        db.save_version_worklog(prior_project_id, "spec", {"date": date(2026, 11, 1),
+            "member_id": self.member, "subsystem": "Spec", "completed_tasks": 1}, path=self.path)
+        db.save_version_workload(prior_project_id, "verify", "Other", total_functions=10, path=self.path)
+        db.set_version_workflow_status(prior_project_id, "spec_review_status", "완료", self.path)
+        db.set_version_workflow_status(prior_project_id, "verification_targets_confirmed", True, self.path)
         db.replace_version_assignments(prior_project_id, "verify", [{"subsystem": "Other", "member_id": self.member,
             "functions": 10, "effort_score": 500}], self.path)
         balanced = recommend_distribution(db.load_team_data(self.path), db.get_version_project(self.project_id, self.path),
@@ -244,13 +261,22 @@ class InternalProjectTests(unittest.TestCase):
     def test_live_recommendation_prioritizes_separate_phase_owner_and_reports_pm_exception(self):
         helper = db.add_member("주해원", "QA", 20, path=self.path)
         db.set_skill(helper, "요구사양서 작성", 2, path=self.path)
+        db.set_skill(helper, "단위테스트", 2, path=self.path)
         db.save_version_workload(self.project_id, "spec", "HCU", total_tasks=10, path=self.path)
         db.save_version_workload(self.project_id, "verify", "HCU", total_functions=10,
                                  total_requirements=5, path=self.path)
+        db.save_version_worklog(self.project_id, "spec", {"date": date(2026, 11, 1),
+            "member_id": self.member, "subsystem": "HCU", "completed_tasks": 10}, path=self.path)
+        db.replace_version_assignments(self.project_id, "spec", [{"subsystem": "HCU", "member_id": self.member,
+            "tasks": 10}], self.path)
+        db.set_version_workflow_status(self.project_id, "spec_review_status", "완료", self.path)
+        db.set_version_workflow_status(self.project_id, "verification_targets_confirmed", True, self.path)
+        db.replace_version_assignments(self.project_id, "verify", [{"subsystem": "HCU", "member_id": self.member,
+            "functions": 10, "requirements": 5}], self.path)
         db.save_version_worklog(self.project_id, "verify", {"date": date(2026, 11, 2),
             "member_id": self.member, "subsystem": "HCU", "completed_functions": 1}, path=self.path)
         result = recommend_subsystem(db.get_version_project(self.project_id, self.path), db.load_team_data(self.path),
-            "spec", self.member, date(2026, 11, 3), self.path)
+            "verify", self.member, date(2026, 11, 3), self.path)
         item = result["basis"][0]
         self.assertTrue(item["separation_needed"])
         self.assertFalse(item["separation_exception"])
@@ -260,7 +286,7 @@ class InternalProjectTests(unittest.TestCase):
 
         db.add_leave(helper, date(2026, 11, 3), date(2026, 11, 3), "연차", path=self.path)
         no_alternative = recommend_subsystem(db.get_version_project(self.project_id, self.path),
-            db.load_team_data(self.path), "spec", self.member, date(2026, 11, 3), self.path)
+            db.load_team_data(self.path), "verify", self.member, date(2026, 11, 3), self.path)
         self.assertTrue(no_alternative["separation_exception"])
         self.assertIn("PM", no_alternative["reason"])
 

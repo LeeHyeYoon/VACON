@@ -223,6 +223,18 @@ def _subsystem_rotation_history(team, current_version: str, path=None) -> dict[t
                 streak += 1
             else:
                 break
+        spec_streak = 0
+        for version in reversed(ordered_versions):
+            if version in spec:
+                spec_streak += 1
+            else:
+                break
+        verify_streak = 0
+        for version in reversed(ordered_versions):
+            if version in verify:
+                verify_streak += 1
+            else:
+                break
         # Count history relative to the latest observed prior version. Keep a
         # short recency window as evidence for the PM, independent of phase.
         recent_versions = ordered_versions[-3:]
@@ -234,6 +246,8 @@ def _subsystem_rotation_history(team, current_version: str, path=None) -> dict[t
             "cross_phase_versions": sorted(spec & verify, key=order),
             "recent_versions": recent,
             "consecutive_versions": streak,
+            "spec_consecutive_versions": spec_streak,
+            "verify_consecutive_versions": verify_streak,
         }
     return result
 
@@ -527,7 +541,8 @@ def _split_units(total: int, weights: dict[int, float]) -> dict[int, int]:
     return out
 
 
-def recommend_distribution(team, project: dict, phase: str, workloads: list[dict], today: date, path=None) -> dict:
+def recommend_distribution(team, project: dict, phase: str, workloads: list[dict], today: date, path=None,
+                           exclude_member_ids: set[int] | None = None) -> dict:
     """휴가·기존 업무량·역량을 반영한 검토용 배분안. 저장은 PM 승인 후 별도 수행한다."""
     if phase not in ("spec", "verify"):
         raise ValueError("phase는 spec 또는 verify여야 합니다.")
@@ -535,22 +550,27 @@ def recommend_distribution(team, project: dict, phase: str, workloads: list[dict
     if not members:
         return {"rows": [], "warnings": ["단위 검증 담당자(김재강·주해원·황지원·이혜윤)가 등록되어 있지 않아 배분안을 만들 수 없습니다."], "needs_more_staff": None}
     unit_pool = team.unit_pool()
+    excluded = {int(value) for value in (exclude_member_ids or set())}
     skill_names = {mid: [str(s["skill"]) for s in team.skills[team.skills["member_id"] == mid].to_dict("records")]
                    for mid in members}
     warnings = []
     if phase == "verify":
-        candidate_ids = sorted(unit_pool)
+        candidate_ids = sorted(unit_pool - excluded)
         skill_basis = "지정 단위 검증 담당자"
     elif phase == "spec":
         skilled = {mid for mid, names in skill_names.items()
                    if any("요구사양서" in name or "사양서 작성" in name for name in names)}
-        candidate_ids = sorted(set(members))
+        candidate_ids = sorted(set(members) - excluded)
         skill_basis = "지정 단위 검증 담당자"
         if not skilled:
             warnings.append("지정 담당자의 요구사양서 작성 역량 정보가 없어 해당 네 명 안에서 업무량·이력을 기준으로 배분합니다.")
     else:
-        candidate_ids = sorted(members)
+        candidate_ids = sorted(set(members) - excluded)
         skill_basis = "지정 단위 검증 담당자"
+    if not candidate_ids:
+        return {"rows": [], "warnings": ["휴가자를 제외하고 배정할 수 있는 지정 담당자가 없습니다."],
+                "needs_more_staff": True, "due": project["spec_due" if phase == "spec" else "verify_due"],
+                "skill_basis": skill_basis, "history_available": False}
 
     due = project["spec_due" if phase == "spec" else "verify_due"]
     deadline_days = (due - today).days if due else None

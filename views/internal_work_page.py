@@ -1,5 +1,6 @@
 """PM용 단위 검증 버전 일정 및 계획 화면."""
 import re
+from datetime import date
 
 import pandas as pd
 import streamlit as st
@@ -7,6 +8,7 @@ import streamlit as st
 from data import db
 from services import llm
 from services.internal_projects import dashboard, is_internal_version, recommend_distribution
+from services.coverage import workflow_stage
 from services.models import today
 from views.common import header, show_df
 
@@ -18,7 +20,8 @@ def _save_project(project, **changes):
         "version", "status", "spec_start", "spec_due", "verify_start", "verify_due", "total_items",
         "spec_total_items", "verify_spec_total_items", "verify_total_items", "spec_done", "verify_done",
         "spec_registered", "verify_registered", "spec_owner_id", "verify_owner_id", "spec_owner_ids",
-        "verify_owner_ids", "source_info", "notes", "holidays", "daily_spec_capacity", "daily_verify_capacity")}
+        "verify_owner_ids", "source_info", "notes", "holidays", "daily_spec_capacity", "daily_verify_capacity",
+        "spec_review_status", "verification_targets_confirmed", "verification_targets_confirmed_at", "verify_summary_status")}
     fields.update(changes)
     saved = db.save_version_project(fields, project_id=int(project["id"]))
     st.cache_data.clear()
@@ -67,10 +70,20 @@ def _schedule_and_workload(project):
         status = c[2].selectbox("버전 상태", statuses,
             index=statuses.index(project["status"]) if project["status"] in statuses else 0,
             key=f"internal_status_{project['id']}")
+        holidays_text = st.text_input("이 버전의 회사 공휴일 (YYYY-MM-DD, 쉼표 구분)",
+            value=", ".join(project.get("holidays", [])),
+            help="등록된 날짜는 업무 가능 일수와 완료 예상일 계산에서 제외합니다.",
+            key=f"internal_holidays_{project['id']}")
         if st.form_submit_button("마감일 저장"):
             try:
+                holiday_values = []
+                for token in holidays_text.replace("\n", ",").split(","):
+                    token = token.strip()
+                    if token:
+                        holiday_values.append(date.fromisoformat(token).isoformat())
                 _save_project(project, spec_due=spec_due, verify_due=verify_due,
                               status=status,
+                              holidays=holiday_values,
                               spec_registered=bool(project["spec_registered"] or spec_due),
                               verify_registered=bool(project["verify_registered"] or verify_due))
                 st.success("버전 마감일을 저장했습니다.")
@@ -222,6 +235,12 @@ def _render_recommendations(project, team, allow_approval=True):
     tabs = st.tabs(["요구사양서 작성 배분", "동적 검증 배분"])
     for tab, phase in zip(tabs, ("spec", "verify")):
         with tab:
+            if phase == "verify" and workflow_stage(project)["stage"] in ("spec_plan", "spec_work"):
+                st.warning("요구사양서 작성 목표가 완료된 뒤 동적 검증 배정을 시작할 수 있습니다.")
+                continue
+            if phase == "verify" and workflow_stage(project)["stage"] == "done":
+                st.info("등록된 동적 검증 목표를 모두 완료했습니다.")
+                continue
             workloads = db.list_version_workloads(project["id"], phase)
             if not workloads:
                 st.info("먼저 일정/물량 탭에서 서브시스템별 물량을 등록하세요.")
@@ -292,8 +311,16 @@ def render(team, rules=None):
     by_id = {int(p["id"]): p for p in projects}
     selected_id = st.selectbox("버전", list(by_id), format_func=lambda pid: by_id[pid]["version"], key="internal_version_pick")
     project = db.get_version_project(selected_id)
-    st.subheader(f"{project['version']} · VACON 계획")
-    st.caption("요구사양서 작성 일감과 동적 검증 함수·요구사양서 목표 및 실적은 서로 다른 테이블에서 관리됩니다.")
+    st.subheader("\uC5C5\uBB34 \uC9C4\uD589 \uD604\uD669")
+    stage = workflow_stage(project)
+    st.info(stage["message"])
+    spec_total, spec_done = stage["spec"]
+    verify_requirements = stage["verify"]["requirements"]
+    verify_functions = stage["verify"]["functions"]
+    step_cols = st.columns(3)
+    step_cols[0].metric("\uC694\uAD6C\uC0AC\uC591\uC11C \uC791\uC131", f"{min(spec_done, spec_total)} / {spec_total}" if spec_total else "\uACC4\uD68D \uBBF8\uB4F1\uB85D")
+    step_cols[1].metric("\uB3D9\uC801 \uAC80\uC99D \uB300\uC0C1 \uC694\uAD6C\uC0AC\uC591\uC11C", verify_requirements[0])
+    step_cols[2].metric("\uB3D9\uC801 \uAC80\uC99D \uB300\uC0C1 \uD568\uC218", verify_functions[0])
     st.caption(f"요구사양서 작성 전체 일감: {project['spec_total_items']} · 동적 검증 등록 전체 요구사양서: {project['verify_spec_total_items']}")
     split_history = [h for h in db.version_project_history(project["id"])
                      if h["field"] == "verify_spec_total_items" and str(h.get("new_value", "")).startswith("0 — 기존 공용값 분리")]
