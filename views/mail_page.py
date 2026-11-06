@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 
 from services import llm
-from services import mail_ai, groupware_mail
+from services import groupware_mail, imap_mail, mail_ai
 from services import mail_digest as md
 from services.models import today
 from views.common import header, show_df
@@ -14,82 +14,82 @@ LEVEL_BADGE = {"높음": "🔴 높음", "보통": "🟠 보통", "낮음": "🟢
 
 
 def render(team, rules):
-    header("📧 메일 요약", "대상 기간을 선택하고 그룹웨어에 로그인해 받은 메일을 요약합니다.")
-    st.info("그룹웨어 메일은 읽기 전용으로 가져옵니다. 원문은 VACON DB에 저장하지 않고 현재 브라우저 세션에만 유지합니다. ALIRA 요약 시 메일 내용은 사내 ALIRA 서버로 전송됩니다.")
+    header("📧 메일 요약", "대상 기간을 선택하고 회사 메일 계정으로 받은 메일을 요약합니다.")
+    st.info("회사 메일은 IMAP 읽기 전용으로 가져옵니다. 원문은 VACON DB에 저장하지 않고 현재 브라우저 세션에만 유지합니다. ALIRA 요약 시 메일 내용은 사내 ALIRA 서버로 전송됩니다.")
     st.caption("ALIRA 요청에는 메일당 본문 최대 3,000자까지 포함합니다. 메일이 많으면 여러 묶음으로 나눠 요약합니다.")
     rng = st.date_input("대상 기간", value=(today(), today()), key="mail_target_range")
     if not isinstance(rng, (tuple, list)) or len(rng) != 2:
         st.info("시작일과 종료일을 모두 선택하세요.")
         return
     s, e = rng
-    account_name = (st.session_state.get("gw_username") or "").strip() or "그룹웨어 계정"
+    account_name = (st.session_state.get("gw_username") or "").strip() or "메일 계정"
     st.session_state.setdefault("mails", [])
-    if not groupware_mail.configured():
-        st.warning("회사 그룹웨어 연결은 Windows 10/11 PC에서 사용할 수 있습니다.")
-    else:
-        if st.button("저장된 로그인 정보 불러오기", disabled=not groupware_mail.has_saved_credentials(), key="gw_load_credentials"):
-            try:
-                saved = groupware_mail.load_credentials() or {}
-                st.session_state.gw_username = saved.get("username", "")
-                st.session_state.gw_password = saved.get("password", "")
-                st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
-        username = st.text_input("그룹웨어 아이디", key="gw_username")
-        password = st.text_input("그룹웨어 비밀번호", type="password", key="gw_password")
-        account_name = username.strip() or "그룹웨어 계정"
-        remember = st.checkbox("이 PC에 로그인 정보 저장 (Windows 계정으로 암호화)", key="gw_remember_credentials")
-        status = st.session_state.get("gw_login_status")
-        if status and status.get("account") == username.strip():
-            (st.success if status.get("ok") else st.error)(status["message"])
-        check_col, fetch_col = st.columns(2)
-        if check_col.button("그룹웨어 로그인 확인", disabled=not (username and password), key="gw_check_login"):
-            try:
-                with st.spinner("그룹웨어 로그인과 받은메일함 접근을 확인하고 있습니다…"):
-                    message = groupware_mail.check_login(username, password)
-                st.session_state.gw_login_status = {"ok": True, "account": username.strip(), "message": message}
-                st.rerun()
-            except Exception as exc:
-                st.session_state.gw_login_status = {"ok": False, "account": username.strip(), "message": f"로그인 확인 실패: {exc}"}
-                st.rerun()
-        if fetch_col.button("대상 기간 메일 가져오기", disabled=not (username and password), key=f"gw_fetch_{s}_{e}"):
-            try:
-                with st.spinner("그룹웨어에서 대상 기간의 받은 메일을 읽고 있습니다…"):
-                    fetched, truncated = groupware_mail.fetch_received_mail(s, e, username, password)
-                if remember:
-                    groupware_mail.save_credentials(username, password)
-                st.session_state.gw_login_status = {"ok": True, "account": username.strip(), "message": "로그인 확인됨 · 받은메일함 접근 가능"}
-                st.session_state.mails = fetched
-                st.session_state.mail_source = "회사 그룹웨어"
-                st.session_state.mail_ai_digest = None
-                st.session_state.mail_fetch_truncated = truncated
-                st.session_state.gw_fetch_notice = f"그룹웨어 로그인 확인됨 · 메일 {len(fetched)}건 조회"
-                st.rerun()
-            except Exception as exc:
-                st.session_state.gw_login_status = {"ok": False, "account": username.strip(), "message": f"그룹웨어 연결 실패: {exc}"}
-                st.error(st.session_state.gw_login_status["message"])
-        if groupware_mail.has_saved_credentials() and st.button("저장된 로그인 정보 삭제", key="gw_delete_credentials"):
-            groupware_mail.delete_credentials()
-            st.session_state.pop("gw_login_status", None)
-            st.success("저장된 로그인 정보를 삭제했습니다.")
-        st.caption("로그인 확인은 새 브라우저 세션으로 인증한 뒤 받은메일함 접근 여부를 확인합니다. 로그인 정보는 기본 저장하지 않으며, 저장을 선택하면 이 Windows 계정으로만 복호화할 수 있게 암호화합니다.")
-        if st.session_state.get("gw_fetch_notice"):
-            st.success(st.session_state.pop("gw_fetch_notice"))
+    can_save = groupware_mail.configured()
+    if can_save and st.button("저장된 로그인 정보 불러오기", disabled=not groupware_mail.has_saved_credentials(),
+                              key="gw_load_credentials"):
+        try:
+            saved = groupware_mail.load_credentials() or {}
+            st.session_state.gw_username = saved.get("username", "")
+            st.session_state.gw_password = saved.get("password", "")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    username = st.text_input("메일 주소 (예: hong@suresofttech.com)", key="gw_username")
+    password = st.text_input("그룹웨어 비밀번호", type="password", key="gw_password")
+    account_name = username.strip() or "메일 계정"
+    remember = can_save and st.checkbox("이 PC에 로그인 정보 저장 (Windows 계정으로 암호화)", key="gw_remember_credentials")
+    status = st.session_state.get("gw_login_status")
+    if status and status.get("account") == username.strip():
+        (st.success if status.get("ok") else st.error)(status["message"])
+    check_col, fetch_col = st.columns(2)
+    if check_col.button("메일 서버 로그인 확인", disabled=not (username and password), key="gw_check_login"):
+        try:
+            with st.spinner("메일 서버(IMAP) 로그인을 확인하고 있습니다…"):
+                message = imap_mail.check_login(username, password)
+            st.session_state.gw_login_status = {"ok": True, "account": username.strip(), "message": message}
+        except Exception as exc:
+            st.session_state.gw_login_status = {"ok": False, "account": username.strip(), "message": f"로그인 확인 실패: {exc}"}
+        st.rerun()
+    if fetch_col.button("대상 기간 메일 가져오기", disabled=not (username and password), key=f"gw_fetch_{s}_{e}"):
+        try:
+            with st.spinner("메일 서버에서 대상 기간의 받은 메일을 읽고 있습니다…"):
+                fetched, truncated = imap_mail.fetch_received_mail(s, e, username, password)
+            if remember:
+                groupware_mail.save_credentials(username, password)
+            st.session_state.gw_login_status = {"ok": True, "account": username.strip(), "message": "로그인 확인됨 · 받은메일함 접근 가능"}
+            st.session_state.mails = fetched
+            st.session_state.mail_source = "회사 메일 서버(IMAP)"
+            st.session_state.mail_ai_digest = None
+            st.session_state.mail_fetch_truncated = truncated
+            st.session_state.gw_fetch_notice = f"메일 {len(fetched)}건 조회 ({s} ~ {e})"
+            st.rerun()
+        except Exception as exc:
+            st.session_state.gw_login_status = {"ok": False, "account": username.strip(), "message": f"메일 가져오기 실패: {exc}"}
+            st.error(st.session_state.gw_login_status["message"])
+    if can_save and groupware_mail.has_saved_credentials() and st.button("저장된 로그인 정보 삭제", key="gw_delete_credentials"):
+        groupware_mail.delete_credentials()
+        st.session_state.pop("gw_login_status", None)
+        st.success("저장된 로그인 정보를 삭제했습니다.")
+    st.caption(f"메일 서버 {imap_mail.host()}:{imap_mail.port()}(IMAP, SSL)에 읽기 전용으로 접속합니다. "
+               "메일의 읽음 상태는 바뀌지 않습니다. 로그인 정보는 기본 저장하지 않으며, 저장을 선택하면 "
+               "이 Windows 계정으로만 복호화할 수 있게 암호화합니다.")
+    if st.session_state.get("gw_fetch_notice"):
+        st.success(st.session_state.pop("gw_fetch_notice"))
 
     mails = st.session_state.mails
     c1, c2 = st.columns([3, 1])
     source = st.session_state.get("mail_source")
     c1.write(f"현재 불러온 메일: **{len(mails)}건**" + (f" · 출처 {source}" if source else ""))
     if st.session_state.get("mail_fetch_truncated"):
-        st.warning(f"가져오기 한도 {groupware_mail.MAX_MESSAGES}건에 도달했습니다. 선택한 기간의 메일이 더 있으면 날짜 범위를 나눠 조회하세요.")
+        st.warning(f"가져오기 한도 {imap_mail.MAX_MESSAGES}건에 도달했습니다. 선택한 기간의 메일이 더 있으면 날짜 범위를 나눠 조회하세요.")
     if mails and c2.button("메일 모두 지우기"):
         st.session_state.mails = []
         st.session_state.mail_source = ""
         st.session_state.mail_ai_digest = None
         st.rerun()
     if not mails:
-        if st.session_state.get("mail_source") == "회사 그룹웨어":
-            st.info("선택한 기간에 받은 그룹웨어 메일이 없습니다.")
+        if st.session_state.get("mail_source") == "회사 메일 서버(IMAP)":
+            st.info("선택한 기간에 받은 메일이 없습니다.")
         return
 
     res = md.summarize_mails(mails, s, e, team, None, today())
@@ -105,7 +105,7 @@ def render(team, rules):
         st.warning(f"날짜가 없어 기간을 판단할 수 없는 메일이 {len(res['undated'])}건 있습니다. 요약에는 포함되지 않았으니 직접 확인하세요.")
     if not res["items"]:
         if res["undated"]:
-            st.error(f"그룹웨어 메일 제목 {len(res['undated'])}건은 찾았지만 목록에서 수신 날짜를 읽지 못했습니다. 날짜 형식 확인이 필요합니다.")
+            st.error(f"메일 {len(res['undated'])}건은 찾았지만 수신 날짜를 읽지 못했습니다. 원문을 직접 확인하세요.")
         else:
             st.info("선택한 기간에 받은 메일이 없습니다.")
         return
