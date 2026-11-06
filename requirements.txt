@@ -2,5 +2,4 @@ streamlit>=1.40
 pandas>=2.0
 plotly>=5.20
 pytest>=8.0
-# 선택: AI Agent 및 LLM 문장화(ANTHROPIC_API_KEY 설정 시 사용)
-# anthropic>=0.40
+# AI Agent 및 LLM 문장화는 사내 OpenAI 호환 서버(ALIRA_API_BASE·ALIRA_MODEL)를 표준 라이브러리로 호출하므로 추가 패키지 불필요

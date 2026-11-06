@@ -106,7 +106,7 @@ def render(team, rules):
 
     digest = md.digest_markdown(res, team.name(lv["member_id"]), today())
     st.subheader("복귀 브리핑 문서")
-    if llm.llm_available() and st.checkbox("AI로 브리핑 다듬기 (메일 제목·요약이 외부 LLM API로 전송됩니다)"):
+    if llm.llm_available() and st.checkbox("AI로 브리핑 다듬기 (메일 제목·요약이 사내 LLM 서버로 전송됩니다)"):
         ai = llm.summarize_digest(digest)
         st.info("🤖 " + ai) if ai else st.warning("AI 요약에 실패해 규칙 기반 요약만 표시합니다.")
     st.markdown(digest)

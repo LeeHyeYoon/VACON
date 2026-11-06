@@ -2,7 +2,7 @@ import streamlit as st
 
 from services import llm
 from services.agent import run_agent
-from services.assistant import SUPPORTED, answer_question
+from services.assistant import answer_question
 from services.models import today
 from views.common import header, show_df
 
@@ -29,26 +29,22 @@ def _render_msg(msg, idx):
 
 def render(team, rules):
     header("💬 AI 비서", "실제 데이터에 근거해 답하며, 지원하지 않는 질문은 추측하지 않고 안내합니다.")
-    st.caption("LLM 상태: " + ("연결됨(규칙 기반 결과를 자연어로 요약)" if llm.llm_available()
-                             else "미설정 — 규칙 기반 질의로 동작합니다(API 키 불필요)"))
-    agent_enabled = st.checkbox("다단계 AI Agent 사용 (Anthropic API로 질문과 필요한 VACON 조회 결과를 전송)",
-                                value=False, disabled=not llm.llm_available(),
-                                help="켜면 VACON 조회 도구를 최대 6회 사용해 복합 질문을 분석합니다. 도구는 조회 전용이며 실제 일정/담당자 변경은 하지 않습니다.")
-    if not llm.llm_available():
-        st.caption("Agent는 ANTHROPIC_API_KEY와 anthropic 패키지가 설정되면 사용할 수 있습니다.")
+    agent_ready = llm.llm_available()
+    if agent_ready:
+        st.caption("AI Agent 사용 중 — 질문과 필요한 VACON 조회 결과가 사내 LLM 서버로 전송됩니다. "
+                   "도구는 조회 전용이며 실제 일정/담당자 변경은 하지 않습니다.")
+    else:
+        st.caption("LLM 미설정 — 규칙 기반 질의로 동작합니다. "
+                   "AI Agent는 ALIRA_API_BASE와 ALIRA_MODEL 환경변수가 설정되면 사용됩니다.")
     st.session_state.setdefault("chat", [])
-    st.write("예시 질문")
-    cols = st.columns(len(SUPPORTED[:4]))
-    for col, q in zip(cols, SUPPORTED[:4]):
-        col.button(q, key=f"ex_{q}", on_click=lambda q=q: st.session_state.update(pending=q))
 
-    typed = st.chat_input("질문을 입력하세요 (예: 다음 주에 업무 공백 위험이 높은 날짜는?)")
-    query = typed or st.session_state.pop("pending", None)
+    query = st.chat_input("질문을 입력하세요 (예: 다음 주에 업무 공백 위험이 높은 날짜는?)")
     if query:
         ans = answer_question(query, team, today(), rules)
         agent_calls, agent_error, ai_text = [], "", None
-        if agent_enabled and llm.llm_available():
-            result = run_agent(query, team, rules, today())
+        if agent_ready:
+            with st.spinner("AI Agent가 VACON 데이터를 조회하며 답변을 만드는 중입니다..."):
+                result = run_agent(query, team, rules, today())
             agent_calls = result.calls
             if result.used:
                 ans.text = result.text
@@ -59,10 +55,6 @@ def render(team, rules):
                 if not ans.supported:
                     ans.text += "\n\n" + agent_error
                 ai_text = llm.rephrase(query, ans.text, ans.facts) if ans.supported and ans.facts else None
-        else:
-            if not ans.supported and llm.llm_available():
-                agent_error = "버전 분석이나 여러 도구를 조합하는 질문은 Agent를 켜면 처리할 수 있습니다."
-            ai_text = llm.rephrase(query, ans.text, ans.facts) if ans.supported and ans.facts else None
         st.session_state.chat.append({"role": "user", "text": query})
         st.session_state.chat.append({"role": "assistant", "text": ans.text, "tables": ans.tables,
                                       "documents": ans.documents, "ai_text": ai_text,

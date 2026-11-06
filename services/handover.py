@@ -1,9 +1,12 @@
-"""템플릿 기반 인수인계 문서 생성. 데이터가 없으면 '미입력'으로 표시한다."""
+"""인수인계 문서 생성. 템플릿(데이터가 없으면 '미입력')과, 그 템플릿·추천·위험 근거로 LLM이 작성하는 문서."""
 from __future__ import annotations
 
 from datetime import date
 
+from . import llm
 from .models import TeamData, isnull
+from .recommend import recommend_backups
+from .risk import assess_tasks, format_reasons
 from .worklog import METRIC_COLS, METRIC_LABELS, TRACKS, leave_impact, recent_summary
 
 MISSING = "미입력"
@@ -113,3 +116,47 @@ def generate_handover(team: TeamData, member_id: int, start: date, end: date,
     L += ["- [ ] 팀 캘린더 및 메신저 부재 알림 설정", "- [ ] 대체 담당자와 인수인계 미팅 완료", ""]
     L.append(f"_생성일: {today or date.today()} · VACON 템플릿 기반 자동 생성. 내용은 휴가자와 대체 담당자가 검토 후 확정하세요._")
     return "\n".join(L)
+
+
+def handover_facts(team: TeamData, member_id: int, start: date, end: date, rules: dict | None = None) -> str:
+    """LLM 작성용 추가 근거: 대체 담당자 미지정 업무의 추천 후보와 휴가 기간 업무 위험."""
+    active = [t for t in team.task_records() if t.get("owner_id") == member_id and t.get("status") != "완료"]
+    L = ["## 대체 담당자 미지정 업무의 추천 후보 (VACON 추천 로직, 미확정)"]
+    unassigned = [t for t in active if isnull(t.get("backup_id"))]
+    for t in unassigned:
+        try:
+            res = recommend_backups(team, int(t["id"]), start, end, rules, top_n=3)
+        except ValueError as exc:
+            L.append(f"- {t['name']}: 추천 불가({exc})")
+            continue
+        if not res["candidates"]:
+            L.append(f"- {t['name']}: 추천 가능한 후보 없음 " + " ".join(res["warnings"]))
+        for c in res["candidates"]:
+            L.append(f"- {t['name']} → {c['이름']} (점수 {c['추천 점수']}, {c['예상 업무 부담']}); "
+                     f"이유: {', '.join(c['추천 이유']) or '-'}; 주의: {', '.join(c['주의사항']) or '-'}")
+    if not unassigned:
+        L.append("- 해당 없음 (모든 미완료 업무에 대체 담당자 지정됨)")
+    L.append("")
+    L.append("## 휴가 기간 업무 위험 (VACON 위험 분석)")
+    names = {t["name"] for t in active}
+    risks = assess_tasks(team, start, end, rules)
+    rows = [r for r in risks.to_dict("records") if r.get("업무") in names] if not risks.empty else []
+    for r in rows:
+        reasons = r.get("근거")
+        actions = r.get("대응 방안")
+        L.append(f"- {r['업무']}: {r.get('위험도')} (점수 {r.get('점수')}); "
+                 f"근거: {format_reasons(reasons) if isinstance(reasons, list) else reasons}; "
+                 f"대응: {' / '.join(actions) if isinstance(actions, list) else actions}")
+    if not rows:
+        L.append("- 해당 없음")
+    return "\n".join(L)
+
+
+def generate_ai_handover(team: TeamData, member_id: int, start: date, end: date, leave_type: str | None = None,
+                         today: date | None = None, rules: dict | None = None) -> tuple[str, bool]:
+    """LLM이 템플릿과 추천·위험 근거로 인수인계 문서를 작성한다. (문서, LLM 사용 여부). 실패 시 템플릿 문서."""
+    draft = generate_handover(team, member_id, start, end, leave_type, today)
+    if not llm.llm_available():
+        return draft, False
+    written = llm.write_handover(draft, handover_facts(team, member_id, start, end, rules))
+    return (written, True) if written else (draft, False)

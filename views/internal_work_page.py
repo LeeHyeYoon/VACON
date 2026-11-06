@@ -272,7 +272,7 @@ def _render_recommendations(project, team, allow_approval=True):
                 st.error("과거 처리 이력 기준으로 일부 배정이 처리 능력을 초과합니다. 추가 인력 또는 일정 조정 검토가 필요합니다.")
             elif not result["history_available"]:
                 st.info("과거 시트 또는 T0800 이상 내부 기록이 쌓이면 담당자별 과거 처리량을 이용해 마감 가능성을 더 정확하게 계산합니다.")
-            consent = st.checkbox("추천 요약을 LLM으로 다듬기 (버전·배정 수량·팀원명이 Anthropic API로 전송됨)",
+            consent = st.checkbox("추천 요약을 LLM으로 다듬기 (버전·배정 수량·팀원명이 사내 LLM 서버로 전송됨)",
                                   key=f"llm_recommend_consent_{phase}_{project['id']}")
             if consent and st.button("AI 설명 만들기", key=f"llm_recommend_{phase}_{project['id']}"):
                 if not llm.llm_available():

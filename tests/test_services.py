@@ -163,6 +163,22 @@ class HandoverTests(unittest.TestCase):
         md = handover.generate_handover(team(), 3, D(0), D(4))
         self.assertIn("등록된 담당 업무가 없습니다", md)
 
+    def test_ai_handover_uses_llm_with_facts_and_falls_back(self):
+        from unittest import mock
+        tm = team([task(notes="", remaining="")], [leave(1, D(0), D(4))])
+        facts = handover.handover_facts(tm, 1, D(0), D(4))
+        self.assertIn("추천 후보", facts); self.assertIn("T → B", facts); self.assertIn("업무 위험", facts)
+        template = handover.generate_handover(tm, 1, D(0), D(4), "연차", D(0))
+        with mock.patch.object(handover.llm, "llm_available", return_value=False):
+            self.assertEqual(handover.generate_ai_handover(tm, 1, D(0), D(4), "연차", D(0)), (template, False))
+        with mock.patch.object(handover.llm, "llm_available", return_value=True), \
+                mock.patch.object(handover.llm, "write_handover", return_value="# AI 문서") as write:
+            self.assertEqual(handover.generate_ai_handover(tm, 1, D(0), D(4), "연차", D(0)), ("# AI 문서", True))
+            self.assertEqual(write.call_args.args, (template, facts))
+        with mock.patch.object(handover.llm, "llm_available", return_value=True), \
+                mock.patch.object(handover.llm, "write_handover", return_value=None):
+            self.assertEqual(handover.generate_ai_handover(tm, 1, D(0), D(4), "연차", D(0)), (template, False))
+
 
 class ValidationTests(unittest.TestCase):
     def test_leave_rules(self):

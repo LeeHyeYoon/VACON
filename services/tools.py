@@ -39,6 +39,12 @@ TOOL_DEFINITIONS = [
          "end_date": {"type": "string", "description": "휴가 종료일 YYYY-MM-DD"}}, "required": ["member_name", "start_date", "end_date"]}},
 ]
 
+def openai_tools() -> list[dict]:
+    """TOOL_DEFINITIONS를 OpenAI 호환 chat/completions의 tools 형식으로 변환한다."""
+    return [{"type": "function", "function": {"name": t["name"], "description": t["description"],
+                                              "parameters": t["input_schema"]}} for t in TOOL_DEFINITIONS]
+
+
 _ARGUMENT_KEYS = {
     "list_vacations": {"start_date", "end_date", "member_name"},
     "get_version_status": {"version"},

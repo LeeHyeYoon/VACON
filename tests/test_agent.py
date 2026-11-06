@@ -1,34 +1,41 @@
+import json
 import os
 import shutil
 import unittest
 from datetime import date
-from types import SimpleNamespace
+from unittest import mock
 
 from data import db
+from services import llm, llm_client
 from services.agent import run_agent
 from services.models import make_team
-from services.tools import TOOL_DEFINITIONS, execute_tool
+from services.tools import TOOL_DEFINITIONS, execute_tool, openai_tools
 
 
-class FakeMessages:
+class FakeClient:
     def __init__(self, responses):
         self.responses = iter(responses)
         self.requests = []
 
-    def create(self, **kwargs):
-        self.requests.append(kwargs)
+    def chat(self, messages, **kwargs):
+        self.requests.append({"messages": [dict(m) for m in messages], **kwargs})
         item = next(self.responses)
         if isinstance(item, Exception):
             raise item
         return item
 
 
-def tool_use(name, args, ident="toolu_1"):
-    return SimpleNamespace(type="tool_use", name=name, input=args, id=ident)
+def tool_call(name, args, ident="call_1"):
+    raw = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+    return {"id": ident, "type": "function", "function": {"name": name, "arguments": raw}}
 
 
-def response(*blocks, stop="tool_use"):
-    return SimpleNamespace(content=list(blocks), stop_reason=stop)
+def response(*calls):
+    return {"role": "assistant", "content": None, "tool_calls": list(calls)}
+
+
+def text(content):
+    return {"role": "assistant", "content": content, "tool_calls": None}
 
 
 class AgentTests(unittest.TestCase):
@@ -67,32 +74,91 @@ class AgentTests(unittest.TestCase):
                           "recommend_backup", "draft_handover"})
 
     def test_multistep_tool_call_round_trip(self):
-        client = SimpleNamespace(messages=FakeMessages([
-            response(tool_use("get_version_status", {"version": "T0070"}, "toolu_1")),
-            response(tool_use("list_vacations", {"start_date": "2026-11-02", "end_date": "2026-11-06",
-                                                  "member_name": "주해원"}, "toolu_2")),
-            response(tool_use("get_daily_workload", {"version": "T0070"}, "toolu_3")),
-            response(SimpleNamespace(type="text", text="T0070의 진행과 권장량을 확인했습니다."), stop="end_turn"),
+        client = FakeClient(([
+            response(tool_call("get_version_status", {"version": "T0070"}, "call_1")),
+            response(tool_call("list_vacations", {"start_date": "2026-11-02", "end_date": "2026-11-06",
+                                                  "member_name": "주해원"}, "call_2")),
+            response(tool_call("get_daily_workload", {"version": "T0070"}, "call_3")),
+            text("T0070의 진행과 권장량을 확인했습니다."),
         ]))
         result = run_agent("T0070 일정과 업무량을 확인해줘", self.team, {}, date(2026, 10, 26), client=client)
         self.assertTrue(result.used)
         self.assertIn("권장량", result.text)
         self.assertEqual([c["tool"] for c in result.calls], ["get_version_status", "list_vacations", "get_daily_workload"])
-        sent = client.messages.requests[1]["messages"][-1]["content"]
-        self.assertEqual(sent[0]["type"], "tool_result")
+        sent = client.requests[1]["messages"]
+        self.assertEqual(sent[0]["role"], "system")
+        self.assertEqual(sent[-2]["tool_calls"][0]["id"], "call_1")
+        self.assertEqual((sent[-1]["role"], sent[-1]["tool_call_id"]), ("tool", "call_1"))
+        self.assertEqual(client.requests[0]["tools"], openai_tools())
 
     def test_repeat_call_is_blocked_and_api_error_is_reported(self):
-        repeated = SimpleNamespace(messages=FakeMessages([
-            response(tool_use("get_version_status", {"version": "T0070"}, "toolu_1")),
-            response(tool_use("get_version_status", {"version": "T0070"}, "toolu_2")),
-            response(SimpleNamespace(type="text", text="반복 호출을 중단했습니다."), stop="end_turn"),
+        repeated = FakeClient(([
+            response(tool_call("get_version_status", {"version": "T0070"}, "call_1")),
+            response(tool_call("get_version_status", {"version": "T0070"}, "call_2")),
+            text("반복 호출을 중단했습니다."),
         ]))
         result = run_agent("T0070 상태 알려줘", self.team, {}, date(2026, 10, 26), client=repeated)
         self.assertEqual([x["status"] for x in result.calls], ["ok", "error"])
-        failed = SimpleNamespace(messages=FakeMessages([RuntimeError("network down")]))
+        failed = FakeClient(([RuntimeError("network down")]))
         result = run_agent("질문", self.team, {}, date(2026, 10, 26), client=failed)
         self.assertFalse(result.used)
         self.assertIn("호출에 실패", result.error)
+
+    def test_bad_arguments_and_reasoning_are_handled(self):
+        client = FakeClient([
+            response(tool_call("get_version_status", "{not json", "call_1")),
+            text("<think>내부 추론</think>버전명을 다시 알려 주세요."),
+        ])
+        result = run_agent("상태 알려줘", self.team, {}, date(2026, 10, 26), client=client)
+        self.assertEqual(result.calls[0]["status"], "error")
+        self.assertIn("JSON", result.calls[0]["error"])
+        self.assertEqual(result.text, "버전명을 다시 알려 주세요.")
+
+    def test_openai_tool_format(self):
+        tools = openai_tools()
+        self.assertEqual({t["function"]["name"] for t in tools}, {t["name"] for t in TOOL_DEFINITIONS})
+        self.assertTrue(all(t["type"] == "function" and t["function"]["parameters"]["type"] == "object" for t in tools))
+
+
+class LlmClientTests(unittest.TestCase):
+    def test_availability_follows_environment(self):
+        with mock.patch.dict(os.environ, {"ALIRA_API_BASE": "", "ALIRA_MODEL": "", "VACON_LLM_MODEL": ""}):
+            self.assertFalse(llm.llm_available())
+            self.assertIsNone(llm.rephrase("q", "a", "f"))
+            self.assertFalse(run_agent("질문", make_team(), {}, date(2026, 10, 26)).available)
+        with mock.patch.dict(os.environ, {"ALIRA_API_BASE": "http://llm.test/v1/", "ALIRA_MODEL": "m"}):
+            self.assertTrue(llm.llm_available())
+            self.assertEqual(llm_client.api_base(), "http://llm.test/v1")
+
+    def test_request_body_disables_thinking_by_default(self):
+        captured = {}
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"choices": [{"message": {"role": "assistant", "content": "답"}}]}).encode()
+
+        def fake_urlopen(req, timeout):
+            captured.update(url=req.full_url, body=json.loads(req.data), auth=req.get_header("Authorization"))
+            return Resp()
+
+        env = {"ALIRA_API_BASE": "http://llm.test/v1", "ALIRA_MODEL": "Qwen/Qwen3.6-27B",
+               "ALIRA_API_KEY": "", "VACON_LLM_THINKING": ""}
+        with mock.patch.dict(os.environ, env), mock.patch("urllib.request.urlopen", fake_urlopen):
+            self.assertEqual(llm_client.complete("sys", "user"), "답")
+        self.assertEqual(captured["url"], "http://llm.test/v1/chat/completions")
+        self.assertEqual(captured["body"]["model"], "Qwen/Qwen3.6-27B")
+        self.assertEqual(captured["body"]["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertIsNone(captured["auth"])
+
+    def test_complete_returns_none_on_failure(self):
+        with mock.patch.dict(os.environ, {"ALIRA_API_BASE": "http://llm.test/v1", "ALIRA_MODEL": "m"}),                 mock.patch("urllib.request.urlopen", side_effect=OSError("down")):
+            self.assertIsNone(llm_client.complete("sys", "user"))
 
 
 if __name__ == "__main__":
