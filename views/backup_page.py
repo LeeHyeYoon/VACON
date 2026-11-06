@@ -4,6 +4,7 @@ import streamlit as st
 from data import db
 from services.models import TeamData
 from services.coverage import recommend_version_leave_coverage, scheduled_leave_targets
+from services import coverage_ai, llm_client
 from views.common import header, show_df
 
 
@@ -43,16 +44,44 @@ def _render_version_leave_coverage(team):
                            if any(int(row.get(field, 0) or 0) for field in
                                   ("추가 배정 일감", "추가 배정 요구사양서", "추가 배정 함수"))]
         if recommendations:
+            fingerprint = coverage_ai.input_fingerprint(result, selected)
+            recommendation_key = f"coverage_ai_recommendation_{selected['id']}"
+            saved_ai = st.session_state.get(recommendation_key)
+            if saved_ai and saved_ai.get("fingerprint") != fingerprint:
+                st.session_state.pop(recommendation_key, None)
+                saved_ai = None
+            error_key = f"coverage_ai_error_{selected['id']}"
+            if st.session_state.get(error_key, {}).get("fingerprint") != fingerprint:
+                st.session_state.pop(error_key, None)
+            st.caption("ALIRA가 업무 경험과 가용량을 비교해 대체 담당자를 추천합니다. 배정 수량은 VACON의 실제 업무·일정 데이터로 계산됩니다.")
+            if not llm_client.configured():
+                st.info("ALIRA 설정이 없어 대체 담당자를 추천할 수 없습니다. ALIRA_API_BASE와 ALIRA_MODEL 환경변수를 확인하세요.")
+            elif saved_ai is None and st.session_state.get(error_key) is None:
+                try:
+                    with st.spinner("ALIRA가 업무 이력과 후보별 가용량을 비교하고 있습니다…"):
+                        saved_ai = coverage_ai.recommend_candidates(result, selected)
+                    st.session_state[recommendation_key] = saved_ai
+                except Exception as exc:
+                    st.session_state[error_key] = {"fingerprint": fingerprint, "message": str(exc)}
+
+            saved_error = st.session_state.get(error_key)
+            if saved_error and saved_error.get("fingerprint") == fingerprint:
+                st.error(f"ALIRA 후보 추천에 실패했습니다: {saved_error['message']}")
             display_number = lambda value: "계산 불가" if value is None else f"하루 평균 {value:.1f}개"
-            if phase == "spec":
-                show_df(pd.DataFrame([{"대체 담당자": row["담당자"],
-                    "하루 작성 목표": display_number(row.get("하루 작성 목표"))}
-                    for row in recommendations]))
-            else:
-                show_df(pd.DataFrame([{"대체 담당자": row["담당자"],
-                    "하루 검증 요구사양서": display_number(row.get("하루 검증 요구사양서 목표")),
-                    "하루 검증 함수": display_number(row.get("하루 검증 함수 목표"))}
-                    for row in recommendations]))
+            if saved_ai:
+                row_by_id = {row["member_id"]: row for row in recommendations}
+                table = []
+                for item in saved_ai["recommendations"]:
+                    row = row_by_id[item["member_id"]]
+                    values = {"순위": len(table) + 1, "대체 담당자": row["담당자"]}
+                    if phase == "spec":
+                        values["하루 작성 목표"] = display_number(row.get("하루 작성 목표"))
+                    else:
+                        values["하루 검증 요구사양서"] = display_number(row.get("하루 검증 요구사양서 목표"))
+                        values["하루 검증 함수"] = display_number(row.get("하루 검증 함수 목표"))
+                    values["추천 사유"] = item["추천 사유"]
+                    table.append(values)
+                show_df(pd.DataFrame(table))
         else:
             st.info("과거 처리 이력과 현재 배정 잔량을 확인할 수 있는 담당자가 없어 추천 수량을 만들지 않았습니다.")
     if result.get("confidence") == "예측 불가":

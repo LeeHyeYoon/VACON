@@ -232,7 +232,7 @@ def summarize_mails(mails: list[dict], start: date, end: date, team: TeamData | 
 def digest_markdown(res: dict, who: str = "", today: date | None = None) -> str:
     s, e = res["period"]
     st = res["stats"]
-    L = [f"# 부재 기간 메일 요약{' — ' + who if who else ''}", "",
+    L = [f"# 대상 기간 메일 요약{' — ' + who if who else ''}", "",
          f"- 대상 기간: {s} ~ {e}", f"- 기간 내 메일: {st['total']}건 (우선순위 높음 {st['높음']} · 보통 {st['보통']} · 낮음 {st['낮음']})",
          f"- 회신/확인이 필요해 보이는 메일: {st['need_reply']}건", f"- 복귀 시점에 기한이 지난 항목이 있는 메일: {st['past_deadline']}건"]
     if res["outside_count"]:
@@ -250,7 +250,7 @@ def digest_markdown(res: dict, who: str = "", today: date | None = None) -> str:
     L += [f"- {n}: {c}건" for n, c in res["by_sender"]] or ["- 없음"]
     L += ["", "## 전체 목록"]
     L += [f"- ({i['level']}) [{i['date']}] {i['subject'] or '(제목 없음)'} — {i['summary']}" for i in res["items"]] or ["- 없음"]
-    L += ["", f"_규칙 기반 자동 요약({today or date.today()} 생성). 키워드·기한 추출 결과이므로 중요한 메일은 반드시 원문을 확인하세요._"]
+    L += ["", f"_규칙 기반 참고 요약({today or date.today()} 생성). 키워드·기한 추출 결과이므로 중요한 메일은 반드시 원문을 확인하세요._"]
     return "\n".join(L)
 
 

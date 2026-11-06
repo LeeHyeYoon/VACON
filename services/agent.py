@@ -96,4 +96,4 @@ def run_agent(question: str, team, rules: dict, today: date, *, client=None) -> 
                            available=True, used=True, calls=calls, error="최대 Agent 턴 수 초과")
     except Exception as exc:
         return AgentResult("", available=True, used=False, calls=calls,
-                           error=f"LLM Agent 호출에 실패했습니다({type(exc).__name__}).")
+                           error=f"ALIRA Agent 호출에 실패했습니다: {exc}")

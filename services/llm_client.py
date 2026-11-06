@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.error
 import urllib.request
 
 DEFAULT_TIMEOUT = 20
@@ -47,12 +48,41 @@ def chat(messages: list[dict], *, tools: list[dict] | None = None, max_tokens: i
         headers["Authorization"] = f"Bearer {key}"
     req = urllib.request.Request(f"{api_base()}/chat/completions",
                                  data=json.dumps(body, ensure_ascii=False).encode("utf-8"), headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"사내 LLM 서버가 HTTP {exc.code}을 반환했습니다.") from None
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise TimeoutError(f"사내 LLM 응답 시간 초과({timeout:g}초). 서버 부하와 네트워크를 확인하세요.") from None
+        raise ConnectionError(f"사내 LLM 서버에 연결할 수 없습니다: {exc.reason}") from None
+    except TimeoutError:
+        raise TimeoutError(f"사내 LLM 응답 시간 초과({timeout:g}초). 서버 부하와 네트워크를 확인하세요.") from None
     choices = data.get("choices") or []
     if not choices or not isinstance(choices[0].get("message"), dict):
         raise ValueError("LLM 응답에 message가 없습니다.")
     return choices[0]["message"]
+
+
+def check_connection(timeout: float = 8) -> dict:
+    """GET /models로 서버 연결과 설정 모델 등록 여부를 확인한다."""
+    if not configured():
+        raise RuntimeError("ALIRA_API_BASE와 ALIRA_MODEL이 설정되지 않았습니다.")
+    headers = {"Accept": "application/json"}
+    key = os.environ.get("ALIRA_API_KEY", "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    req = urllib.request.Request(f"{api_base()}/models", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"사내 LLM 서버가 HTTP {exc.code}을 반환했습니다.") from None
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"사내 LLM 연결 확인 실패: {exc}") from None
+    ids = [str(item.get("id", "")) for item in data.get("data", []) if isinstance(item, dict)]
+    return {"model": model(), "models": ids, "model_available": model() in ids}
 
 
 def strip_reasoning(text: str | None) -> str:
