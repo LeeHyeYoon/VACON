@@ -62,8 +62,10 @@ python -m pytest -q          # 또는: python -m unittest discover -s tests -v
 ### 메일 요약 (`services/groupware_mail.py`, `services/mail_digest.py`)
 Windows 10/11에서 Selenium으로 회사 그룹웨어(`https://gw.suresofttech.com/app/mail`)에 로그인해 받은 메일을 읽습니다. Outlook, Graph, IMAP 연결은 사용하지 않습니다.
 - 메일 요약 화면에서 **대상 기간**과 그룹웨어 아이디·비밀번호를 입력합니다. **그룹웨어 로그인 확인**은 인증 후 받은메일함 접근까지 검사하고 상태를 표시합니다. 확인된 계정으로 대상 기간의 메일을 가져올 수 있습니다.
+- 로그인 폼과 메일 목록은 최상위 화면과 중첩 iframe에서 찾습니다. 메일 목록이 비동기로 표시될 때까지 기다리고, 받은메일함 페이지를 순회해 대상 기간 메일을 찾습니다(최대 20페이지·500건).
+- 전체 날짜와 연도 없는 `11.06`, `11월 6일` 형식을 지원합니다. 연도가 없는 날짜는 조회 기간 안에서만 해석합니다. 날짜를 읽을 수 없는 메일은 임의로 기간에 넣지 않고 날짜 확인 필요로 표시합니다.
 - 로그인 정보는 기본적으로 저장하지 않습니다. 저장을 선택하면 이 PC의 Windows 사용자 계정 DPAPI로 암호화해 `%LOCALAPPDATA%\VACON\groupware_credentials.bin`에 보관하며, VACON 화면에서 삭제할 수 있습니다.
-- 메일은 VACON DB에 저장하지 않고 현재 Streamlit 세션에만 둡니다. 선택 기간의 메일을 최대 500건까지 처리합니다. ALIRA 복귀 브리핑 작성 시 제목·발신자·본문(메일당 최대 3,000자)이 `ALIRA_API_BASE`의 사내 서버로 전송됩니다. 외부 AI API에는 보내지 않습니다. ALIRA 분석에는 회사 유선 LAN·고정 IP 조건이 필요합니다.
+- 메일은 VACON DB에 저장하지 않고 현재 Streamlit 세션에만 둡니다. ALIRA 메일 브리핑 작성 시 제목·발신자·본문(메일당 최대 3,000자)이 `ALIRA_API_BASE`의 사내 서버로 전송됩니다. 외부 AI API에는 보내지 않습니다. ALIRA 분석에는 회사 유선 LAN·고정 IP 조건이 필요합니다.
 - Selenium Manager가 ChromeDriver를 준비하지 못하면 Chrome 설치 및 사내 네트워크 연결을 확인하세요. 그룹웨어 화면 구조가 바뀌면 로그인·메일 본문 선택 로직을 조정해야 할 수 있습니다.
 - 메일 입력은 그룹웨어 로그인만 제공합니다. ALIRA 연결이 실패하면 로컬 규칙 기반 참고 요약을 표시합니다.
 
