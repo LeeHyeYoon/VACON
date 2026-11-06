@@ -245,6 +245,17 @@ class InternalProjectTests(unittest.TestCase):
         self.assertTrue(overloaded["overloaded"])
         self.assertIn("추가 업무를 권하지 않습니다", overloaded["reason"])
 
+    def test_pm_at_ninety_percent_load_is_not_automatically_blocked(self):
+        pm = db.add_member("주해원", "단위 테스트 PM(선임)", 90, path=self.path)
+        db.set_skill(pm, "단위테스트", 2, path=self.path)
+        db.save_version_workload(self.project_id, "verify", "Audio", total_functions=10,
+                                 total_requirements=5, path=self.path)
+        result = recommend_subsystem(db.get_version_project(self.project_id, self.path),
+            db.load_team_data(self.path), "verify", pm, date(2026, 11, 3), self.path)
+        self.assertFalse(result["overloaded"])
+        self.assertEqual(result["subsystem"], "Audio")
+        self.assertIn("PM의 과부하 차단 기준을 100%", result["reason"])
+
     def test_live_recommendation_marks_rotation_after_consecutive_subsystem_versions(self):
         for version in ("T0500", "T0600", "T0700"):
             db.replace_logs(f"rotation-{version}", [{"track": "req", "date": date(2026, 9, 1),

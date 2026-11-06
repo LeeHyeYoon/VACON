@@ -301,6 +301,67 @@ def _render_recommendations(project, team, allow_approval=True):
                         "승인 시각": r["approved_at"]} for r in approved_rows]))
 
 
+def _render_pm_review_flow(project, stage):
+    st.subheader("PM 검토 완료 처리")
+    spec_total, spec_done = stage["spec"]
+    spec_complete = spec_total > 0 and spec_done >= spec_total
+    verify = stage["verify"]
+    verify_targets_exist = any(total > 0 for total, _ in verify.values())
+    verify_complete = verify_targets_exist and all(done >= total for total, done in verify.values())
+    spec_status = project.get("spec_review_status", "대기")
+    verify_status = project.get("verify_summary_status", "대기")
+
+    spec_col, verify_col = st.columns(2)
+    with spec_col:
+        st.write(f"**요구사양서 PM 검토:** {spec_status}")
+        if not spec_complete:
+            st.caption(f"작성 실적이 완료되어야 검토할 수 있습니다 · {spec_done}/{spec_total}건")
+        elif spec_status == "완료":
+            st.success("요구사양서 검토가 완료됐습니다.")
+        elif spec_status == "검토 중":
+            if st.button("요구사양서 검토 완료 처리", key=f"spec_review_done_{project['id']}"):
+                try:
+                    db.set_version_workflow_status(project["id"], "spec_review_status", "완료")
+                    st.cache_data.clear()
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"요구사양서 검토를 완료하지 못했습니다: {exc}")
+        elif st.button("요구사양서 검토 시작", key=f"spec_review_start_{project['id']}"):
+            try:
+                db.set_version_workflow_status(project["id"], "spec_review_status", "검토 중")
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as exc:
+                st.error(f"요구사양서 검토를 시작하지 못했습니다: {exc}")
+
+    with verify_col:
+        verify_label = {"대기": "대기", "정리 중": "검토 중", "완료": "검토 완료"}.get(verify_status, verify_status)
+        st.write(f"**동적 검증 PM 검토:** {verify_label}")
+        if spec_status != "완료":
+            st.caption("요구사양서 작성 및 PM 검토 완료 후 동적 검증 검토를 진행할 수 있습니다.")
+        elif not verify_complete:
+            req = verify["requirements"]
+            funcs = verify["functions"]
+            st.caption(f"검증 실적 완료 후 검토할 수 있습니다 · 요구사양서 {req[1]}/{req[0]}건 · 함수 {funcs[1]}/{funcs[0]}개")
+        elif verify_status == "완료":
+            st.success("동적 검증 검토가 완료됐습니다.")
+        elif verify_status == "정리 중":
+            if st.button("동적 검증 검토 완료 처리", key=f"verify_review_done_{project['id']}"):
+                try:
+                    db.set_version_workflow_status(project["id"], "verify_summary_status", "완료")
+                    st.cache_data.clear()
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"동적 검증 검토를 완료하지 못했습니다: {exc}")
+        elif st.button("동적 검증 검토 시작", key=f"verify_review_start_{project['id']}"):
+            try:
+                db.set_version_workflow_status(project["id"], "verify_summary_status", "정리 중")
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as exc:
+                st.error(f"동적 검증 검토를 시작하지 못했습니다: {exc}")
+
+
 def render(team, rules=None):
     header("🗓️ (PM) 검증 일정 관리", "PM이 버전별 요구사양서 작성·동적 검증 목표와 마감일을 관리합니다. 실제 기록은 검증 업무 기록에서 입력합니다.")
     _create_version_form()
@@ -326,6 +387,7 @@ def render(team, rules=None):
                      if h["field"] == "verify_spec_total_items" and str(h.get("new_value", "")).startswith("0 — 기존 공용값 분리")]
     if split_history:
         st.info("이전 화면에서 공용으로 쓰던 동적 검증 사양서 수는 변경 이력에 보관했습니다. 실제 동적 검증 목표 수를 별도 입력하세요.")
+    _render_pm_review_flow(project, stage)
     if WORKLOG_PAGE is not None:
         def open_worklog(version):
             st.session_state["worklog_version"] = version

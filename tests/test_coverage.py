@@ -51,6 +51,19 @@ class VersionCoverageTests(unittest.TestCase):
                 self.assertEqual(result["phase"], "verify")
                 self.assertEqual(result["total_demand"], 20)
                 self.assertEqual(result["total_allocated"], 20)
+                self.assertEqual(result["demand_by_metric"], {"requirements": 10, "functions": 10})
+                self.assertEqual(result["allocated_by_metric"]["requirements"], 10)
+                self.assertEqual(result["allocated_by_metric"]["functions"], 10)
+                self.assertGreater(result["remaining_workdays"], 0)
+                self.assertAlmostEqual(result["team_daily_required"]["requirements"],
+                    10 / result["remaining_workdays"])
+                self.assertAlmostEqual(result["team_daily_required"]["functions"],
+                    10 / result["remaining_workdays"])
+                for row in result["rows"]:
+                    self.assertEqual(set(row["daily_targets"]), {"requirements", "functions"})
+                for metric in ("requirements", "functions"):
+                    self.assertAlmostEqual(sum(row["daily_targets"][metric] or 0 for row in result["rows"]),
+                        result["team_daily_required"][metric])
                 self.assertEqual(len(result["assignments"]), 3)
                 self.assertNotIn(member_id, [row["member_id"] for row in result["assignments"]])
                 self.assertTrue(all(row["functions"] + row["requirements"] > 0 for row in result["assignments"]))
@@ -83,7 +96,7 @@ class VersionCoverageTests(unittest.TestCase):
             ("T0810", "spec", date(2026, 11, 15), date(2026, 11, 20)),
         ])
 
-    def test_dynamic_target_starts_after_spec_completion_without_manual_review_gate(self):
+    def test_dynamic_target_starts_after_pm_spec_organization_is_complete(self):
         member_id = self.members["김재강"]
         prior = db.get_version_project(self.project_id, self.path)
         prior["verify_due"] = date(2026, 11, 9)
@@ -98,6 +111,7 @@ class VersionCoverageTests(unittest.TestCase):
         db.save_version_workload(project_id, "verify", "HCU", total_functions=2, total_requirements=2, path=self.path)
         db.save_version_worklog(project_id, "spec", {"date": date(2026, 11, 5), "member_id": member_id,
             "subsystem": "HCU", "completed_tasks": 1}, path=self.path)
+        db.set_version_workflow_status(project_id, "spec_review_status", "완료", self.path)
         db.replace_version_assignments(project_id, "verify", [{"subsystem": "HCU", "member_id": member_id,
             "functions": 2, "requirements": 2}], self.path)
         leave_id = db.add_leave(member_id, date(2026, 11, 10), date(2026, 11, 12), "연차", path=self.path)
@@ -124,6 +138,7 @@ class VersionCoverageTests(unittest.TestCase):
         db.save_version_workload(project_id, "verify", "HCU", total_functions=1, total_requirements=1, path=self.path)
         db.save_version_worklog(project_id, "spec", {"date": date(2026, 11, 5), "member_id": member_id,
             "subsystem": "HCU", "completed_tasks": 1}, path=self.path)
+        db.set_version_workflow_status(project_id, "spec_review_status", "완료", self.path)
         project = db.get_version_project(project_id, self.path)
         self.assertEqual(workflow_stage(project, self.path)["stage"], "verify_work")
         self.assertEqual(db.list_version_assignments(project_id, "verify", self.path), [])
@@ -155,6 +170,7 @@ class VersionCoverageTests(unittest.TestCase):
         self.assertEqual(result["mode"], "project_rebalance")
         self.assertEqual(result["total_demand"], 16)
         self.assertEqual(result["total_allocated"], 16)
+        self.assertEqual(result["demand_by_metric"], {"requirements": 8, "functions": 8})
         self.assertTrue(result["saveable"])
         assignments = result["project_assignments"]
         self.assertNotIn(absent_id, [row["member_id"] for row in assignments])
@@ -186,6 +202,7 @@ class VersionCoverageTests(unittest.TestCase):
         self.assertEqual(result["mode"], "project_rebalance")
         self.assertEqual(result["total_demand"], 8)
         self.assertEqual(result["total_allocated"], 8)
+        self.assertEqual(result["demand_by_metric"], {"requirements": 4, "functions": 4})
         self.assertNotIn(absent_id, [row["member_id"] for row in result["project_assignments"]])
         self.assertEqual(sum(row["requirements"] for row in result["project_assignments"]), 4)
         self.assertEqual(sum(row["functions"] for row in result["project_assignments"]), 4)
@@ -211,6 +228,53 @@ class VersionCoverageTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "확인 필요")
         self.assertIn("요구사양서 작성 실적은 0/1건", rows[0]["reason"])
         self.assertIn("동적 검증 담당 배정 0명·실적 0건", rows[0]["reason"])
+
+    def test_verification_leave_target_waits_for_pm_spec_organization(self):
+        member_id = self.members["김재강"]
+        base_project = db.get_version_project(self.project_id, self.path)
+        base_project["status"] = "완료"
+        db.save_version_project(base_project, self.path, self.project_id)
+        project_id = db.save_version_project({"version": "T0880", "status": "준비",
+            "spec_start": date(2026, 11, 1), "spec_due": date(2026, 11, 5),
+            "verify_start": date(2026, 11, 6), "verify_due": date(2026, 11, 20),
+            "spec_registered": True, "verify_registered": True, "spec_owner_ids": [member_id],
+            "verify_owner_ids": [member_id], "spec_total_items": 1,
+            "verify_spec_total_items": 2, "verify_total_items": 2}, path=self.path)
+        db.save_version_workload(project_id, "spec", "HCU", total_tasks=1, path=self.path)
+        db.save_version_workload(project_id, "verify", "HCU", total_functions=2,
+                                 total_requirements=2, path=self.path)
+        db.save_version_worklog(project_id, "spec", {"date": date(2026, 11, 5),
+            "member_id": member_id, "subsystem": "HCU", "completed_tasks": 1}, path=self.path)
+        leave_id = db.add_leave(member_id, date(2026, 11, 10), date(2026, 11, 10), "연차", path=self.path)
+        rows = [row for row in scheduled_leave_targets(db.load_team_data(self.path), date(2026, 11, 4), self.path)
+                if row["leave_id"] == leave_id and row["project_id"] == project_id]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["phase"], "verify")
+        self.assertEqual(rows[0]["status"], "확인 필요")
+        self.assertIn("PM 정리 상태", rows[0]["reason"])
+
+    def test_pm_can_complete_spec_review_after_all_spec_work_is_done(self):
+        project = db.get_version_project(self.project_id, self.path)
+        self.assertEqual(project["spec_review_status"], "완료")
+        db.set_version_workflow_status(self.project_id, "spec_review_status", "검토 중", self.path)
+        self.assertEqual(db.get_version_project(self.project_id, self.path)["spec_review_status"], "검토 중")
+        db.set_version_workflow_status(self.project_id, "spec_review_status", "완료", self.path)
+        self.assertEqual(db.get_version_project(self.project_id, self.path)["spec_review_status"], "완료")
+
+    def test_dynamic_review_completion_is_validated_and_reopened_after_log_edit(self):
+        member_id = self.members["김재강"]
+        with self.assertRaisesRegex(ValueError, "동적 검증 실적이 완료되지 않았습니다"):
+            db.set_version_workflow_status(self.project_id, "verify_summary_status", "정리 중", self.path)
+        log_id = db.save_version_worklog(self.project_id, "verify", {"date": date(2026, 11, 3),
+            "member_id": member_id, "subsystem": "HCU", "completed_functions": 40,
+            "completed_requirements": 40}, path=self.path)
+        db.set_version_workflow_status(self.project_id, "verify_summary_status", "정리 중", self.path)
+        db.set_version_workflow_status(self.project_id, "verify_summary_status", "완료", self.path)
+        changed = db.save_version_worklog(self.project_id, "verify", {"date": date(2026, 11, 3),
+            "member_id": member_id, "subsystem": "HCU", "completed_functions": 39,
+            "completed_requirements": 39}, log_id=log_id, path=self.path)
+        self.assertEqual(changed, log_id)
+        self.assertEqual(db.get_version_project(self.project_id, self.path)["verify_summary_status"], "정리 중")
 
 
 if __name__ == "__main__":

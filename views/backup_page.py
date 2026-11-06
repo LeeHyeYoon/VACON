@@ -23,31 +23,40 @@ def _render_version_leave_coverage(team):
     result = recommend_version_leave_coverage(team, project, selected["member_id"],
         selected["overlap_start"], selected["overlap_end"])
     st.subheader("AI 추천 대체 업무")
-    demand_label = "버전 잔여 업무량(개인별 배정 없음)" if result.get("mode") == "project_rebalance" else "대체 가능 잔여량"
-    st.write(f"**{demand_label}:** {result.get('total_demand', 0)} · **마감 준수 예측:** {result['summary']}")
-    st.caption(f"마감일 {result.get('due') or '데이터 없음'} · 예측 신뢰도 {result['confidence']} · {result['message']}")
+    phase = result.get("phase", selected["phase"])
+    team_daily = result.get("team_daily_required", {})
+    remaining_days = result.get("remaining_workdays", 0)
+    if phase == "spec":
+        st.write(f"**마감까지 실제 근무일:** {remaining_days}일 · **팀 전체 하루 필요 작성량:** "
+                 f"{team_daily.get('tasks'):.1f}개/일" if team_daily.get("tasks") is not None else
+                 f"**마감까지 실제 근무일:** {remaining_days}일 · **팀 전체 하루 필요 작성량:** 계산 불가")
+    else:
+        req_daily = team_daily.get("requirements")
+        func_daily = team_daily.get("functions")
+        req_text = f"{req_daily:.1f}개/일" if req_daily is not None else "계산 불가"
+        func_text = f"{func_daily:.1f}개/일" if func_daily is not None else "계산 불가"
+        st.write(f"**마감까지 실제 근무일:** {remaining_days}일 · **팀 전체 하루 필요량:** "
+                 f"요구사양서 {req_text} · 함수 {func_text}")
+    st.caption(f"마감일 {result.get('due') or '데이터 없음'} · 과거 실제 처리량 기준: {result['summary']} · 신뢰도 {result['confidence']}")
     if result["rows"]:
-        recommendations = [row for row in result["rows"] if row.get("추가 배정 일감", 0) or row.get("추가 배정 요구사양서", 0) or row.get("추가 배정 함수", 0)]
-        summary_cols = st.columns(3)
-        summary_cols[0].metric("버전 잔여 업무" if result.get("mode") == "project_rebalance" else "휴가자 잔여 업무", result.get("total_demand", 0))
-        summary_cols[1].metric("AI 분배 제안", result.get("total_allocated", 0))
-        summary_cols[2].metric("분배 후 미배정", result.get("remaining_unallocated", 0))
+        recommendations = [row for row in result["rows"]
+                           if any(int(row.get(field, 0) or 0) for field in
+                                  ("추가 배정 일감", "추가 배정 요구사양서", "추가 배정 함수"))]
         if recommendations:
-            show_df(pd.DataFrame([{"추천 담당자": row["담당자"], "기존 업무량": row["기존 업무량"],
-            "추가 업무량": (f"일감 {row['추가 배정 일감']}" if selected["phase"] == "spec" else
-                           f"요구사양서 {row['추가 배정 요구사양서']} · 함수 {row['추가 배정 함수']}"),
-            "예상 완료일": row["예상 완료일"], "마감 준수": row["마감 준수 여부"],
-            "추천 사유": row["추천 근거"]} for row in recommendations]))
-            for index, row in enumerate(recommendations, 1):
-                with st.expander(f"{index}. {row['담당자']} · 추가 업무 배정 근거"):
-                    st.write(f"**예상 완료일:** {row['예상 완료일']} · **마감 준수:** {row['마감 준수 여부']}")
-                    st.write(row["추천 근거"])
+            display_number = lambda value: "계산 불가" if value is None else f"하루 평균 {value:.1f}개"
+            if phase == "spec":
+                show_df(pd.DataFrame([{"대체 담당자": row["담당자"],
+                    "하루 작성 목표": display_number(row.get("하루 작성 목표"))}
+                    for row in recommendations]))
+            else:
+                show_df(pd.DataFrame([{"대체 담당자": row["담당자"],
+                    "하루 검증 요구사양서": display_number(row.get("하루 검증 요구사양서 목표")),
+                    "하루 검증 함수": display_number(row.get("하루 검증 함수 목표"))}
+                    for row in recommendations]))
         else:
             st.info("과거 처리 이력과 현재 배정 잔량을 확인할 수 있는 담당자가 없어 추천 수량을 만들지 않았습니다.")
-    if result.get("remaining_unallocated", 0):
-        st.warning("처리 이력과 실제 가용일 기준으로 분배되지 않은 업무가 있습니다. 추가 인력 또는 일정 조정을 검토하세요.")
-    if result.get("confidence") == "낮음":
-        st.warning("실제 이력 데이터가 부족해 예측 신뢰도가 낮습니다. 확인되지 않은 처리량은 배정하지 않았습니다.")
+    if result.get("confidence") == "예측 불가":
+        st.warning("동일 업무의 담당자별 실제 처리량 데이터가 부족해 완료 가능성을 예측할 수 없습니다. 일일 목표는 계획 잔여량과 근무일 기준 참고값입니다.")
     if result.get("mode") == "project_rebalance":
         if result.get("distribution_warnings"):
             for warning in result["distribution_warnings"]:

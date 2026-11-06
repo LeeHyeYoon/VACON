@@ -2,7 +2,6 @@ import pandas as pd
 import streamlit as st
 
 from data import db
-from services.config import DEFAULT_RULES, validate_rules
 from services.models import IMPORTANCE, MBTI_TYPES, SKILL_LEVELS, STATUSES, isnull
 from services.validation import validate_assignees, validate_member, validate_task
 from views import sheet_tab
@@ -13,18 +12,16 @@ MBTI_OPTIONS = ["미입력", *MBTI_TYPES]
 
 
 def render(team, rules):
-    header("🗂️ 데이터 관리", "팀원, 역량, 업무, 마감일, 위험 판단 규칙을 관리합니다.")
-    t1, t2, t5, t3, t4 = st.tabs(["팀원 · 역량", "업무 · 마감일", "시트 연동", "위험 규칙", "초기화"])
+    header("🗂️ 데이터 관리", "팀원, 역량, 업무, 마감일과 시트 연동을 관리합니다.")
+    t1, t2, t3, t4 = st.tabs(["팀원 · 역량", "업무 · 마감일", "시트 연동", "초기화"])
     with t1:
         _members(team)
     with t2:
         _tasks(team)
-    with t5:
-        sheet_tab.render(team, rules)
     with t3:
-        _rules(rules)
+        sheet_tab.render(team, rules)
     with t4:
-        st.warning("모든 데이터(팀원·업무·휴가·규칙)를 삭제하고 샘플 데이터로 되돌립니다.")
+        st.warning("모든 데이터(팀원·업무·휴가·설정)를 삭제하고 샘플 데이터로 되돌립니다.")
         if st.checkbox("초기화에 동의합니다") and st.button("샘플 데이터로 초기화"):
             db.reset_sample()
             st.rerun()
@@ -143,29 +140,3 @@ def _tasks(team):
         st.rerun()
 
 
-def _rules(rules):
-    st.caption("점수 = 해당 조건 가중치의 합. 점수 ≥ High 기준이면 High, ≥ Medium 기준이면 Medium, 그 외 Low.")
-    labels = {"owner_absent": "담당자 부재", "importance_high": "중요도 '상'", "importance_mid": "중요도 '중'",
-              "no_backup": "대체 담당자 미지정", "backup_absent": "대체 담당자도 부재",
-              "deadline_overlap": "마감일 겹침/임박", "no_available_skilled": "역량 보유 근무자 없음",
-              "low_team_availability": "팀 가용 인원 낮음", "skill_pool_low": "역량 보유자 다수 부재"}
-    with st.form("rules"):
-        cols = st.columns(4)
-        w = {k: cols[i % 4].number_input(labels[k], 0, 100, int(rules["weights"][k]), key=f"w_{k}")
-             for i, k in enumerate(labels)}
-        c = st.columns(5)
-        pool_ratio = c[4].slider("역량 보유자 근무 비율 기준", 0.0, 1.0, float(rules["low_pool_ratio"]), 0.05)
-        high = c[0].number_input("High 기준 점수", 1, 300, int(rules["thresholds"]["high"]))
-        med = c[1].number_input("Medium 기준 점수", 1, 300, int(rules["thresholds"]["medium"]))
-        win = c[2].number_input("마감 임박 기준(일)", 0, 30, int(rules["deadline_window_days"]))
-        ratio = c[3].slider("가용 인원 비율 기준", 0.0, 1.0, float(rules["low_availability_ratio"]), 0.05)
-        c = st.columns(2)
-        horizon = c[0].number_input("대시보드 분석 기간(일)", 1, 60, int(rules["horizon_days"]))
-        half = c[1].checkbox("반차도 부재로 계산", value=rules["half_day_counts_as_absent"])
-        saved = st.form_submit_button("규칙 저장")
-    new = {"weights": w, "thresholds": {"high": high, "medium": med}, "deadline_window_days": win,
-           "low_availability_ratio": ratio, "low_pool_ratio": pool_ratio, "half_day_counts_as_absent": half, "horizon_days": horizon}
-    if saved and not errors_box(validate_rules({**DEFAULT_RULES, **new})):
-        db.save_rules(new)
-        st.success("저장했습니다.")
-        st.rerun()

@@ -20,7 +20,7 @@ def render(team, rules):
         st.info("등록된 업무가 없습니다. '데이터 관리'에서 업무를 추가하세요.")
         return
 
-    with st.expander("현재 위험도 판단 규칙 (데이터 관리 > 위험 규칙에서 변경)"):
+    with st.expander("현재 적용 중인 위험도 판단 기준"):
         st.json(rules)
 
     tab_task, tab_day = st.tabs(["업무별", "날짜별"])

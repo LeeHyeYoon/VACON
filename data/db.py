@@ -404,7 +404,7 @@ def save_version_project(fields: dict, path=None, project_id: int | None = None)
     if values["spec_review_status"] not in ("대기", "검토 중", "완료"):
         raise ValueError("요구사양서 PM 검토 상태가 올바르지 않습니다.")
     if values["verify_summary_status"] not in ("대기", "정리 중", "완료"):
-        raise ValueError("검증 결과 PM 취합 상태가 올바르지 않습니다.")
+        raise ValueError("동적 검증 PM 검토 상태가 올바르지 않습니다.")
     if values["spec_done"] > values["spec_total_items"] or values["verify_done"] > values["verify_total_items"]:
         raise ValueError("완료 수는 해당 업무 유형의 전체 대상 수보다 클 수 없습니다.")
     with connect(path) as c:
@@ -435,27 +435,27 @@ def version_project_history(project_id, path=None) -> list[dict]:
 
 
 def set_version_workflow_status(project_id: int, field: str, value, path=None) -> None:
-    """PM-controlled gates for spec review, confirmed verification scope and result collation."""
+    """PM-controlled completion states for spec review and dynamic verification review."""
     allowed = {"spec_review_status", "verification_targets_confirmed", "verify_summary_status"}
     if field not in allowed:
         raise ValueError("지원하지 않는 업무 단계입니다.")
     if field == "spec_review_status" and value not in ("대기", "검토 중", "완료"):
         raise ValueError("요구사양서 검토 상태가 올바르지 않습니다.")
     if field == "verify_summary_status" and value not in ("대기", "정리 중", "완료"):
-        raise ValueError("검증 결과 취합 상태가 올바르지 않습니다.")
+        raise ValueError("동적 검증 PM 검토 상태가 올바르지 않습니다.")
     if field == "verification_targets_confirmed":
         value = int(bool(value))
     with connect(path) as c:
         project = c.execute("SELECT * FROM version_projects WHERE id=?", (int(project_id),)).fetchone()
         if not project:
             raise ValueError("버전을 찾을 수 없습니다.")
-        if field == "spec_review_status" and value == "완료":
+        if field == "spec_review_status" and value in ("검토 중", "완료"):
             planned = int(c.execute("SELECT COALESCE(SUM(total_tasks),0) FROM spec_workloads WHERE project_id=?",
                                     (int(project_id),)).fetchone()[0])
             completed = int(c.execute("SELECT COALESCE(SUM(completed_tasks),0) FROM spec_work_logs WHERE project_id=?",
                                       (int(project_id),)).fetchone()[0])
             if planned <= 0 or completed < planned:
-                raise ValueError(f"요구사양서 작성이 완료되지 않았습니다(계획 {planned}, 완료 {completed}).")
+                raise ValueError(f"요구사양서 작성 실적이 모두 완료된 뒤 PM 검토를 시작할 수 있습니다(계획 {planned}, 완료 {completed}).")
         if field == "verification_targets_confirmed" and value:
             if project["spec_review_status"] != "완료":
                 raise ValueError("PM의 요구사양서 취합 및 검토 완료 후 검증 대상을 확정할 수 있습니다.")
@@ -464,14 +464,22 @@ def set_version_workflow_status(project_id: int, field: str, value, path=None) -
             if int(targets[0]) <= 0 and int(targets[1]) <= 0:
                 raise ValueError("검증 대상 요구사양서 또는 함수 수를 먼저 등록하세요.")
         if field == "verify_summary_status" and value in ("정리 중", "완료"):
-            if not project["verification_targets_confirmed"]:
-                raise ValueError("검증 대상 확정 후 검증 결과를 취합할 수 있습니다.")
+            if project["spec_review_status"] != "완료":
+                raise ValueError("PM의 요구사양서 검토 완료 후 동적 검증 검토를 시작할 수 있습니다.")
+            spec_plan = int(c.execute("SELECT COALESCE(SUM(total_tasks),0) FROM spec_workloads WHERE project_id=?",
+                                      (int(project_id),)).fetchone()[0])
+            spec_done = int(c.execute("SELECT COALESCE(SUM(completed_tasks),0) FROM spec_work_logs WHERE project_id=?",
+                                      (int(project_id),)).fetchone()[0])
+            if spec_plan <= 0 or spec_done < spec_plan:
+                raise ValueError("요구사양서 작성 및 PM 검토가 완료된 뒤 동적 검증 검토를 진행할 수 있습니다.")
             targets = c.execute("SELECT COALESCE(SUM(total_requirements),0),COALESCE(SUM(total_functions),0) "
                                 "FROM verification_workloads WHERE project_id=?", (int(project_id),)).fetchone()
+            if int(targets[0]) <= 0 and int(targets[1]) <= 0:
+                raise ValueError("동적 검증 목표를 먼저 등록하세요.")
             done = c.execute("SELECT COALESCE(SUM(completed_requirements),0),COALESCE(SUM(completed_functions),0) "
                              "FROM version_dynamic_work_logs WHERE project_id=?", (int(project_id),)).fetchone()
-            if (int(targets[0]) <= 0 and int(targets[1]) <= 0) or int(done[0]) < int(targets[0]) or int(done[1]) < int(targets[1]):
-                raise ValueError("미완료 검증 업무가 있어 PM 결과 취합 단계로 이동할 수 없습니다.")
+            if int(done[0]) < int(targets[0]) or int(done[1]) < int(targets[1]):
+                raise ValueError(f"동적 검증 실적이 완료되지 않았습니다(요구사양서 {done[0]}/{targets[0]}, 함수 {done[1]}/{targets[1]}).")
         old_value = project[field]
         if old_value == value:
             return
@@ -514,6 +522,17 @@ def _invalidate_spec_review(c, project_id: int) -> None:
             c.execute("INSERT INTO version_history(project_id,field,old_value,new_value) VALUES (?,?,?,?)",
                       (int(project_id), field, str(old) if old is not None else None,
                        str(new) if new is not None else None))
+
+
+def _invalidate_verify_review(c, project_id: int) -> None:
+    """Reopen PM verification review whenever its targets or actuals change after approval."""
+    row = c.execute("SELECT verify_summary_status FROM version_projects WHERE id=?", (int(project_id),)).fetchone()
+    if not row or row["verify_summary_status"] != "완료":
+        return
+    c.execute("UPDATE version_projects SET verify_summary_status='정리 중',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+              (int(project_id),))
+    c.execute("INSERT INTO version_history(project_id,field,old_value,new_value) VALUES (?,?,?,?)",
+              (int(project_id), "verify_summary_status", "완료", "정리 중"))
 
 
 def list_version_backup_assignments(project_id: int, phase: str | None = None, path=None) -> list[dict]:
@@ -860,6 +879,7 @@ def save_version_workload(project_id: int, phase: str, subsystem: str, *, total_
                          VALUES (?,?,?,?) ON CONFLICT(project_id,subsystem_id) DO UPDATE SET
                          total_tasks=excluded.total_tasks,difficulty=excluded.difficulty,updated_at=CURRENT_TIMESTAMP""",
                       (int(project_id), subsystem_id, counts["total_tasks"], difficulty))
+            _invalidate_spec_review(c, project_id)
             return int(c.execute("SELECT id FROM spec_workloads WHERE project_id=? AND subsystem_id=?",
                                  (int(project_id), subsystem_id)).fetchone()["id"])
         c.execute("""INSERT INTO verification_workloads(project_id,subsystem_id,total_functions,total_requirements,difficulty)
@@ -867,6 +887,7 @@ def save_version_workload(project_id: int, phase: str, subsystem: str, *, total_
                      total_functions=excluded.total_functions,total_requirements=excluded.total_requirements,
                      difficulty=excluded.difficulty,updated_at=CURRENT_TIMESTAMP""",
                   (int(project_id), subsystem_id, counts["total_functions"], counts["total_requirements"], difficulty))
+        _invalidate_verify_review(c, project_id)
         return int(c.execute("SELECT id FROM verification_workloads WHERE project_id=? AND subsystem_id=?",
                              (int(project_id), subsystem_id)).fetchone()["id"])
 
@@ -940,11 +961,13 @@ def save_version_worklog(project_id: int, phase: str, fields: dict, log_id: int 
                            "notes=?", "updated_at=strftime('%Y-%m-%d %H:%M:%f','now')"]
             c.execute(f"UPDATE {table} SET {','.join(assignments)} WHERE id=? AND project_id=?",
                       (subsystem_id, log_date, member_id, *values, str(fields.get("notes") or "").strip(), int(log_id), int(project_id)))
+            (_invalidate_spec_review if phase == "spec" else _invalidate_verify_review)(c, project_id)
             return int(log_id)
         cols = ["project_id", "subsystem_id", "log_date", "member_id", *metrics, "notes"]
         placeholders = ",".join("?" for _ in cols)
         cur = c.execute(f"INSERT INTO {table}({','.join(cols)}) VALUES ({placeholders})",
                         (int(project_id), subsystem_id, log_date, member_id, *values, str(fields.get("notes") or "").strip()))
+        (_invalidate_spec_review if phase == "spec" else _invalidate_verify_review)(c, project_id)
         return int(cur.lastrowid)
 
 
@@ -989,6 +1012,7 @@ def delete_version_worklog(project_id: int, phase: str, log_id: int, path=None) 
         if phase == "spec" and c.execute("SELECT 1 FROM version_dynamic_work_logs WHERE project_id=? LIMIT 1", (int(project_id),)).fetchone():
             raise ValueError("동적 검증 실적이 이미 있어 요구사양서 완료 기록을 삭제할 수 없습니다.")
         cur = c.execute(f"DELETE FROM {table} WHERE project_id=? AND id=?", (int(project_id), int(log_id)))
+        (_invalidate_spec_review if phase == "spec" else _invalidate_verify_review)(c, project_id)
         return cur.rowcount > 0
 
 

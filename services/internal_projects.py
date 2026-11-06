@@ -335,7 +335,9 @@ def recommend_subsystem(project: dict, team, phase: str, member_id: int, work_da
     recent_counts = [recent.get(mid, {}).get("records", 0) for mid in members]
     mean_recent = sum(recent_counts) / len(recent_counts) if recent_counts else 0
     workload_pct = int(selected_member.get("workload") or 0)
-    overloaded = workload_pct >= 90 or bool(mean_recent and recent_rows["records"] >= max(6, mean_recent * 1.8))
+    selected_is_pm = "pm" in str(selected_member.get("role") or "").casefold()
+    overload_limit = 100 if selected_is_pm else 90
+    overloaded = workload_pct >= overload_limit or bool(mean_recent and recent_rows["records"] >= max(6, mean_recent * 1.8))
     due = project.get("spec_due" if phase == "spec" else "verify_due")
     start = project.get("spec_start" if phase == "spec" else "verify_start")
     start_source = "계획 시작일" if start else ""
@@ -410,7 +412,9 @@ def recommend_subsystem(project: dict, team, phase: str, member_id: int, work_da
             recent_row = recent.get(candidate_id, {"records": 0, "spec_records": 0, "verify_records": 0})
             phase_recent = recent_row["spec_records" if phase == "spec" else "verify_records"]
             workload = max(0, int(person.get("workload") or 0))
-            if workload >= 90 or (mean_recent and recent_row["records"] >= max(6, mean_recent * 1.8)):
+            candidate_is_pm = "pm" in str(person.get("role") or "").casefold()
+            candidate_overload_limit = 100 if candidate_is_pm else 90
+            if workload >= candidate_overload_limit or (mean_recent and recent_row["records"] >= max(6, mean_recent * 1.8)):
                 continue
             prior_effort = other_version_efforts.get(candidate_id, 0.0)
             current_count = current_records_by_member.get(candidate_id, 0)
@@ -503,6 +507,8 @@ def recommend_subsystem(project: dict, team, phase: str, member_id: int, work_da
         reason += " 선택 담당자의 현재 업무 부담이 높아 이 담당자에게 추가 업무를 권하지 않습니다."
         if best["support_people"]:
             reason += f" 같은 업무 적합성이 확인된 대안 담당자는 {best['support_people'][0]['name']}입니다."
+    elif selected_is_pm and workload_pct >= 90:
+        reason += " PM 업무 분담 요청을 반영해 PM의 과부하 차단 기준을 100%로 적용했습니다."
     if leave and leave.get("type") == "반차":
         reason += " 선택 날짜에 반차가 등록되어 있습니다."
     return {"subsystem": best["subsystem"], "reason": reason, "basis": candidates, "overloaded": overloaded,
@@ -542,7 +548,8 @@ def _split_units(total: int, weights: dict[int, float]) -> dict[int, int]:
 
 
 def recommend_distribution(team, project: dict, phase: str, workloads: list[dict], today: date, path=None,
-                           exclude_member_ids: set[int] | None = None) -> dict:
+                           exclude_member_ids: set[int] | None = None,
+                           member_weight_multipliers: dict[int, float] | None = None) -> dict:
     """휴가·기존 업무량·역량을 반영한 검토용 배분안. 저장은 PM 승인 후 별도 수행한다."""
     if phase not in ("spec", "verify"):
         raise ValueError("phase는 spec 또는 verify여야 합니다.")
@@ -551,6 +558,8 @@ def recommend_distribution(team, project: dict, phase: str, workloads: list[dict
         return {"rows": [], "warnings": ["단위 검증 담당자(김재강·주해원·황지원·이혜윤)가 등록되어 있지 않아 배분안을 만들 수 없습니다."], "needs_more_staff": None}
     unit_pool = team.unit_pool()
     excluded = {int(value) for value in (exclude_member_ids or set())}
+    weight_multipliers = {int(mid): max(0.0, float(multiplier))
+                          for mid, multiplier in (member_weight_multipliers or {}).items()}
     skill_names = {mid: [str(s["skill"]) for s in team.skills[team.skills["member_id"] == mid].to_dict("records")]
                    for mid in members}
     warnings = []
@@ -612,7 +621,8 @@ def recommend_distribution(team, project: dict, phase: str, workloads: list[dict
             multiplier = 1 + (0.1 * level if match else 0) + experience_bonus
             existing_daily_effort = person["reserved_effort"] / max(1.0, person["days"])
             activity_factor = min(1.5, person["recent_records"] / mean_activity) if mean_activity else 0.0
-            weights[mid] = person["capacity"] * multiplier / (1 + existing_daily_effort + 0.2 * activity_factor)
+            weights[mid] = (person["capacity"] * multiplier /
+                            (1 + existing_daily_effort + 0.2 * activity_factor) * weight_multipliers.get(mid, 1.0))
         if not any(weights.values()):
             weights = {mid: (p["days"] or 1.0) for mid, p in profile.items()}
         fields = ([("tasks", "total_tasks", "completed_tasks")] if phase == "spec" else
