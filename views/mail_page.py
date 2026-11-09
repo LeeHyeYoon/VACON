@@ -17,7 +17,7 @@ def render(team, rules):
     header("📧 메일 요약", "대상 기간을 선택하고 회사 메일 계정으로 받은 메일을 요약합니다.")
     st.info("회사 메일은 IMAP 읽기 전용으로 가져옵니다. 원문은 VACON DB에 저장하지 않고 현재 브라우저 세션에만 유지합니다. ALIRA 요약 시 메일 내용은 사내 ALIRA 서버로 전송됩니다.")
     st.caption("ALIRA 요청에는 메일당 본문 최대 3,000자까지 포함합니다. 메일이 많으면 여러 묶음으로 나눠 요약합니다.")
-    rng = st.date_input("대상 기간", value=(today(), today()), key="mail_target_range")
+    rng = st.date_input("휴가 기간", value=(today(), today()), key="mail_target_range")
     if not isinstance(rng, (tuple, list)) or len(rng) != 2:
         st.info("시작일과 종료일을 모두 선택하세요.")
         return
@@ -37,7 +37,7 @@ def render(team, rules):
     username = st.text_input("메일 주소 (예: hong@suresofttech.com)", key="gw_username")
     password = st.text_input("그룹웨어 비밀번호", type="password", key="gw_password")
     account_name = username.strip() or "메일 계정"
-    remember = can_save and st.checkbox("이 PC에 로그인 정보 저장 (Windows 계정으로 암호화)", key="gw_remember_credentials")
+    remember = can_save and st.toggle("이 PC에 로그인 정보 저장 (Windows 계정으로 암호화)", key="gw_remember_credentials")
     status = st.session_state.get("gw_login_status")
     if status and status.get("account") == username.strip():
         (st.success if status.get("ok") else st.error)(status["message"])
@@ -50,7 +50,7 @@ def render(team, rules):
         except Exception as exc:
             st.session_state.gw_login_status = {"ok": False, "account": username.strip(), "message": f"로그인 확인 실패: {exc}"}
         st.rerun()
-    if fetch_col.button("대상 기간 메일 가져오기", disabled=not (username and password), key=f"gw_fetch_{s}_{e}"):
+    if fetch_col.button("메일 가져오기", type="primary", disabled=not (username and password), key=f"gw_fetch_{s}_{e}"):
         try:
             with st.spinner("메일 서버에서 대상 기간의 받은 메일을 읽고 있습니다…"):
                 fetched, truncated = imap_mail.fetch_received_mail(s, e, username, password)

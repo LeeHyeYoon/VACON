@@ -28,130 +28,216 @@ def _save_project(project, **changes):
     return saved
 
 
-def _create_version_form():
-    with st.expander("＋ 버전 생성", expanded=False):
-        st.caption("계획은 T0800 이상 신규 버전에만 등록합니다. 이전 버전 기록은 Google Sheets 원본을 조회합니다.")
-        with st.form("internal_version_create", clear_on_submit=True):
-            version = st.text_input("버전명", placeholder="예: T0800")
-            c = st.columns(2)
-            spec_due = c[0].date_input("요구사양서 작성 마감일", value=today(), key="new_internal_spec_due")
-            verify_due = c[1].date_input("동적 검증 마감일", value=today(), key="new_internal_verify_due")
-            submit = st.form_submit_button("버전 생성")
-        if submit:
-            try:
-                normalized = str(version or "").strip()
-                if not normalized:
-                    raise ValueError("버전명을 입력하세요.")
-                match = re.fullmatch(r"T\s*(\d+)", normalized, re.IGNORECASE)
-                if not match or int(match.group(1)) < 800:
-                    raise ValueError("계획 등록은 T0800 이상 버전에서만 가능합니다. 과거 버전은 Google Sheets 조회 전용입니다.")
-                if any(p["version"].casefold() == normalized.casefold() for p in db.list_version_projects()):
-                    raise ValueError("같은 버전이 이미 등록되어 있습니다.")
-                db.save_version_project({
-                    "version": normalized, "status": "준비", "spec_start": None, "spec_due": spec_due,
-                    "verify_start": None, "verify_due": verify_due,
-                    "spec_total_items": 0, "verify_spec_total_items": 0, "verify_total_items": 0,
-                    "spec_registered": True, "verify_registered": True,
-                    "spec_owner_ids": [], "verify_owner_ids": [], "source_info": "VACON 내부 등록",
-                })
-                st.success(f"{normalized} 버전을 생성했습니다.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"버전을 생성하지 못했습니다: {exc}")
-
-
-def _schedule_and_workload(project):
-    st.subheader("버전 마감일")
-    with st.form(f"internal_dates_{project['id']}"):
-        c = st.columns(3)
-        spec_due = c[0].date_input("요구사양서 작성 마감일", value=project["spec_due"], key=f"internal_spec_due_{project['id']}")
-        verify_due = c[1].date_input("동적 검증 마감일", value=project["verify_due"], key=f"internal_verify_due_{project['id']}")
-        statuses = ["준비", "사양서 작성 중", "검증 진행 중", "완료", "지연"]
-        status = c[2].selectbox("버전 상태", statuses,
-            index=statuses.index(project["status"]) if project["status"] in statuses else 0,
-            key=f"internal_status_{project['id']}")
-        holidays_text = st.text_input("이 버전의 회사 공휴일 (YYYY-MM-DD, 쉼표 구분)",
-            value=", ".join(project.get("holidays", [])),
+def _new_version_deadline_form():
+    st.subheader("새 버전 및 마감일 등록")
+    st.caption("T0800 이상 신규 버전만 VACON에서 관리합니다. T0700 이하 과거 데이터는 Google Sheets 원본을 조회합니다.")
+    with st.form("internal_version_create", clear_on_submit=True):
+        version = st.text_input("버전명", placeholder="예: T0800")
+        c = st.columns(2)
+        spec_due = c[0].date_input("요구사양서 작성 마감일", value=today(), key="new_internal_spec_due")
+        verify_due = c[1].date_input("동적 검증 마감일", value=today(), key="new_internal_verify_due")
+        holidays_text = st.text_input("회사 공휴일 (YYYY-MM-DD, 쉼표 구분)",
             help="등록된 날짜는 업무 가능 일수와 완료 예상일 계산에서 제외합니다.",
-            key=f"internal_holidays_{project['id']}")
-        if st.form_submit_button("마감일 저장"):
+            key="new_internal_holidays")
+        submit = st.form_submit_button("버전 및 마감일 등록")
+    if submit:
+        try:
+            normalized = str(version or "").strip()
+            if not normalized:
+                raise ValueError("버전명을 입력하세요.")
+            match = re.fullmatch(r"T\s*(\d+)", normalized, re.IGNORECASE)
+            if not match or int(match.group(1)) < 800:
+                raise ValueError("T0800 이상 버전만 VACON에서 등록할 수 있습니다.")
+            if any(p["version"].casefold() == normalized.casefold() for p in db.list_version_projects()):
+                raise ValueError("같은 버전이 이미 등록되어 있습니다.")
+            holidays = [date.fromisoformat(token.strip()).isoformat()
+                        for token in holidays_text.replace("\n", ",").split(",") if token.strip()]
+            project_id = db.save_version_project({
+                "version": normalized, "status": "준비", "spec_start": None, "spec_due": spec_due,
+                "verify_start": None, "verify_due": verify_due,
+                "spec_total_items": 0, "verify_spec_total_items": 0, "verify_total_items": 0,
+                "spec_registered": True, "verify_registered": True,
+                "spec_owner_ids": [], "verify_owner_ids": [], "source_info": "VACON 내부 등록",
+                "holidays": holidays,
+            })
+            st.session_state["internal_version_pick_after_create"] = project_id
+            st.cache_data.clear()
+            st.success(f"{normalized} 버전과 마감일을 등록했습니다.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"버전 또는 마감일을 등록하지 못했습니다: {exc}")
+
+
+def _schedule_and_workload(project, team):
+    phase_sections = (("spec", "요구사양서 작성"), ("verify", "동적 검증"))
+    with st.container(key="planning_phase_tabs"):
+        tabs = st.tabs([label for _, label in phase_sections])
+        for tab, (phase_key, _) in zip(tabs, phase_sections):
+            with tab:
+                _planning_phase_content(project, team, phase_key)
+    with st.expander("회사 공휴일 설정", expanded=False):
+        with st.form(f"internal_holidays_{project['id']}", border=False):
+            holidays_text = st.text_input("공휴일 (YYYY-MM-DD, 쉼표 구분)",
+                value=", ".join(project.get("holidays", [])),
+                help="등록된 날짜는 업무 가능 일수와 완료 예상일 계산에서 제외합니다.",
+                key=f"internal_holidays_value_{project['id']}")
+            if st.form_submit_button("공휴일 저장"):
+                try:
+                    holiday_values = [date.fromisoformat(token.strip()).isoformat()
+                                      for token in holidays_text.replace("\n", ",").split(",") if token.strip()]
+                    _save_project(project, holidays=holiday_values)
+                    st.success("회사 공휴일을 저장했습니다.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"공휴일을 저장하지 못했습니다: {exc}")
+
+
+def _planning_phase_content(project, team, phase_key):
+    if phase_key == "verify":
+        st.markdown("#### 검증 대상 요구사양서 규모")
+        with st.form(f"verify_spec_total_form_{project['id']}", border=False):
+            verify_spec_total = st.number_input("동적 검증 등록의 전체 요구사양서 수", min_value=0,
+                value=int(project.get("verify_spec_total_items", 0) or 0), step=1,
+                help="요구사양서 작성 물량과 별도로 관리하는 검증 참고 규모입니다.",
+                key=f"internal_verify_spec_total_{project['id']}")
+            if st.form_submit_button("요구사양서 수 저장"):
+                _save_project(project, verify_spec_total_items=verify_spec_total)
+                st.success("동적 검증의 요구사양서 수를 저장했습니다.")
+                st.rerun()
+    _version_task_schedule_section(project, team, phase_key)
+    st.divider()
+    _workload_section(project, phase_key)
+
+
+def _workload_section(project, phase):
+    title = "요구사양서 작성" if phase == "spec" else "동적 검증"
+    st.markdown("#### 서브시스템 설정")
+    st.caption(f"{title} 단계의 서브시스템별 목표 물량을 등록하고 관리합니다.")
+    workloads = db.list_version_workloads(project["id"], phase)
+    mode = st.segmented_control("서브시스템 설정", ["새 서브시스템 등록", "기존 서브시스템 수정"],
+                                selection_mode="single", default="새 서브시스템 등록",
+                                key=f"workload_mode_{phase}_{project['id']}", width="content",
+                                label_visibility="collapsed") or "새 서브시스템 등록"
+    selected = None
+    if mode == "기존 서브시스템 수정":
+        if not workloads:
+            st.info("수정할 서브시스템 물량이 없습니다. 새 서브시스템을 등록하세요.")
+            return
+        selected = st.selectbox("수정할 서브시스템", workloads, format_func=lambda w: w["subsystem"],
+                                key=f"workload_pick_{phase}_{project['id']}")
+    with st.form(f"workload_form_{phase}_{project['id']}", clear_on_submit=mode == "새 서브시스템 등록", border=False):
+        subsystem = st.text_input("서브시스템명", value=selected["subsystem"] if selected else "",
+                                  placeholder="예: Audio", key=f"workload_name_{phase}_{project['id']}")
+        if phase == "spec":
+            total_tasks = st.number_input("전체 일감 수 (소프트웨어 로직 변경서)", min_value=0,
+                value=int(selected["total_tasks"] if selected else 0), step=1,
+                key=f"spec_tasks_{project['id']}_{selected['id'] if selected else 'new'}")
+            total_functions = total_requirements = 0
+        else:
+            c = st.columns(2)
+            total_functions = c[0].number_input("검증 대상 함수 수", min_value=0,
+                value=int(selected["total_functions"] if selected else 0), step=1,
+                key=f"verify_functions_{project['id']}_{selected['id'] if selected else 'new'}")
+            total_requirements = c[1].number_input("검증 대상 요구사양서 수", min_value=0,
+                value=int(selected["total_requirements"] if selected else 0), step=1,
+                key=f"verify_requirements_{project['id']}_{selected['id'] if selected else 'new'}")
+            total_tasks = 0
+        difficulty = st.select_slider("업무 난이도", options=[1, 2, 3, 4, 5],
+            value=int(selected["difficulty"] if selected else 3), key=f"difficulty_{phase}_{project['id']}_{selected['id'] if selected else 'new'}",
+            help="PM이 조정합니다. 추천 결과의 예상 부담 점수에 반영됩니다.")
+        if st.form_submit_button(f"{title} 물량 저장"):
             try:
-                holiday_values = []
-                for token in holidays_text.replace("\n", ",").split(","):
-                    token = token.strip()
-                    if token:
-                        holiday_values.append(date.fromisoformat(token).isoformat())
-                _save_project(project, spec_due=spec_due, verify_due=verify_due,
-                              status=status,
-                              holidays=holiday_values,
-                              spec_registered=bool(project["spec_registered"] or spec_due),
-                              verify_registered=bool(project["verify_registered"] or verify_due))
-                st.success("버전 마감일을 저장했습니다.")
+                db.save_version_workload(project["id"], phase, subsystem, total_tasks=total_tasks,
+                    total_functions=total_functions, total_requirements=total_requirements, difficulty=difficulty)
+                st.cache_data.clear()
+                st.success(f"{title} 서브시스템 물량을 저장했습니다.")
                 st.rerun()
             except Exception as exc:
-                st.error(f"마감일을 저장하지 못했습니다: {exc}")
+                st.error(f"물량을 저장하지 못했습니다: {exc}")
+    workloads = db.list_version_workloads(project["id"], phase)
+    if workloads:
+        if phase == "spec":
+            frame = [{"서브시스템": w["subsystem"], "전체 일감": w["total_tasks"], "난이도": w["difficulty"]} for w in workloads]
+        else:
+            frame = [{"서브시스템": w["subsystem"], "전체 함수": w["total_functions"],
+                      "전체 요구사양서": w["total_requirements"], "난이도": w["difficulty"]} for w in workloads]
+        show_df(pd.DataFrame(frame))
 
-    phase_tabs = st.tabs(["요구사양서 작성 물량", "동적 검증 물량"])
-    for tab, phase in zip(phase_tabs, ("spec", "verify")):
-        with tab:
-            if phase == "verify":
-                with st.form(f"verify_spec_total_form_{project['id']}"):
-                    verify_spec_total = st.number_input("동적 검증 등록의 전체 요구사양서 수", min_value=0,
-                        value=int(project.get("verify_spec_total_items", 0) or 0), step=1,
-                        help="요구사양서 작성 등록의 전체 일감 수와 별도 관리하는 참고 규모입니다. 함수·서브시스템별 검증 진척도는 아래 개별 목표량으로 계산합니다.",
-                        key=f"internal_verify_spec_total_{project['id']}")
-                    if st.form_submit_button("동적 검증 요구사양서 수 저장"):
-                        _save_project(project, verify_spec_total_items=verify_spec_total)
-                        st.success("동적 검증의 전체 요구사양서 수를 별도로 저장했습니다.")
-                        st.rerun()
-            workloads = db.list_version_workloads(project["id"], phase)
-            existing = [w["subsystem"] for w in workloads]
-            mode = st.radio("서브시스템 설정", ["새 서브시스템 등록", "기존 서브시스템 수정"],
-                            horizontal=True, key=f"workload_mode_{phase}_{project['id']}")
-            selected = None
-            if mode == "기존 서브시스템 수정":
-                if not workloads:
-                    st.info("수정할 서브시스템 물량이 없습니다. 새 서브시스템을 등록하세요.")
-                    continue
-                selected = st.selectbox("수정할 서브시스템", workloads, format_func=lambda w: w["subsystem"],
-                                        key=f"workload_pick_{phase}_{project['id']}")
-            with st.form(f"workload_form_{phase}_{project['id']}", clear_on_submit=mode == "새 서브시스템 등록"):
-                subsystem = st.text_input("서브시스템명", value=selected["subsystem"] if selected else "",
-                                          placeholder="예: Audio", key=f"workload_name_{phase}_{project['id']}")
-                if phase == "spec":
-                    total_tasks = st.number_input("전체 일감 수 (소프트웨어 로직 변경서)", min_value=0,
-                        value=int(selected["total_tasks"] if selected else 0), step=1,
-                        key=f"spec_tasks_{project['id']}_{selected['id'] if selected else 'new'}")
-                    total_functions = total_requirements = 0
-                else:
-                    c = st.columns(2)
-                    total_functions = c[0].number_input("검증 대상 함수 수", min_value=0,
-                        value=int(selected["total_functions"] if selected else 0), step=1,
-                        key=f"verify_functions_{project['id']}_{selected['id'] if selected else 'new'}")
-                    total_requirements = c[1].number_input("검증 대상 요구사양서 수", min_value=0,
-                        value=int(selected["total_requirements"] if selected else 0), step=1,
-                        key=f"verify_requirements_{project['id']}_{selected['id'] if selected else 'new'}")
-                    total_tasks = 0
-                difficulty = st.select_slider("업무 난이도", options=[1, 2, 3, 4, 5],
-                    value=int(selected["difficulty"] if selected else 3), key=f"difficulty_{phase}_{project['id']}_{selected['id'] if selected else 'new'}",
-                    help="PM이 조정합니다. 추천 결과의 예상 부담 점수에 반영됩니다.")
-                if st.form_submit_button("물량 저장"):
-                    try:
-                        db.save_version_workload(project["id"], phase, subsystem, total_tasks=total_tasks,
-                            total_functions=total_functions, total_requirements=total_requirements, difficulty=difficulty)
-                        st.cache_data.clear()
-                        st.success("서브시스템 물량을 저장했습니다.")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"물량을 저장하지 못했습니다: {exc}")
-            workloads = db.list_version_workloads(project["id"], phase)
-            if workloads:
-                if phase == "spec":
-                    frame = [{"서브시스템": w["subsystem"], "전체 일감": w["total_tasks"], "난이도": w["difficulty"]} for w in workloads]
-                else:
-                    frame = [{"서브시스템": w["subsystem"], "전체 함수": w["total_functions"],
-                              "전체 요구사양서": w["total_requirements"], "난이도": w["difficulty"]} for w in workloads]
-                show_df(pd.DataFrame(frame))
+
+def _version_task_schedule_section(project, team, phase):
+    phase_label = "요구사양서 작성" if phase == "spec" else "동적 검증"
+    st.markdown("#### 세부 업무 일정")
+    st.caption("예정 일정이며 실제 업무 실적이나 진척도에는 합산되지 않습니다. 서브시스템 공통 업무로 등록됩니다.")
+    detail = st.selectbox("세부 업무", db.VERSION_TASK_DETAILS[phase], key=f"schedule_detail_new_{project['id']}_{phase}")
+    phase_label = "요구사양서 작성" if phase == "spec" else "동적 검증"
+    members = team.member_records()
+    if not members:
+        st.warning("담당자 등록 후 세부 업무 일정을 추가할 수 있습니다.")
+    else:
+        member_ids = [int(member["id"]) for member in members]
+        member_names = {int(member["id"]): member["name"] for member in members}
+        with st.form(f"add_version_task_schedule_{phase}_{project['id']}", clear_on_submit=True, border=False):
+            entry_columns = st.columns(2)
+            member_id = entry_columns[0].selectbox("담당자", member_ids, format_func=member_names.get,
+                                     key=f"schedule_member_new_{phase}_{project['id']}")
+            work_date = entry_columns[1].date_input("업무 날짜", value=today(), key=f"schedule_date_new_{phase}_{project['id']}")
+            if st.form_submit_button("세부 업무 일정 추가"):
+                try:
+                    db.save_version_task_schedule(project["id"], phase, detail, member_id, work_date)
+                    st.success("세부 업무 일정을 추가했습니다.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"일정을 추가하지 못했습니다: {exc}")
+
+    schedules = [item for item in db.list_version_task_schedules(project["id"]) if item["phase"] == phase]
+    if not schedules:
+        st.info("등록된 세부 업무 일정이 없습니다.")
+        return
+    show_df(pd.DataFrame([{"날짜": item["work_date"], "버전": item["version"],
+                           "담당자": item["member_name"], "업무 구분": phase_label,
+                           "세부 업무": item["task_detail"]} for item in schedules]))
+    if not members:
+        st.warning("현재 등록된 담당자가 없어 일정을 수정하거나 추가할 수 없습니다.")
+        return
+    with st.expander("등록 일정 수정·삭제", expanded=False):
+        _edit_task_schedule(project, phase, schedules, member_ids, member_names)
+
+
+def _edit_task_schedule(project, phase, schedules, member_ids, member_names):
+    phase_label = "요구사양서 작성" if phase == "spec" else "동적 검증"
+    schedule_by_id = {int(item["id"]): item for item in schedules}
+    selected_id = st.selectbox("수정·삭제할 일정", list(schedule_by_id),
+                               format_func=lambda sid: (f"{schedule_by_id[sid]['work_date']} · "
+                                                        f"{schedule_by_id[sid]['member_name']} · "
+                                                        f"{phase_label} · "
+                                                        f"{schedule_by_id[sid]['task_detail']}"),
+                               key=f"schedule_edit_pick_{phase}_{project['id']}")
+    selected = schedule_by_id[selected_id]
+    edit_phase = phase
+    detail_options = db.VERSION_TASK_DETAILS[phase]
+    edit_detail = st.selectbox("수정 세부 업무", detail_options,
+                               index=(detail_options.index(selected["task_detail"])
+                                      if selected["phase"] == edit_phase and selected["task_detail"] in detail_options else 0),
+                               key=f"schedule_edit_detail_{project['id']}_{selected_id}_{edit_phase}")
+    with st.form(f"edit_version_task_schedule_{project['id']}_{selected_id}", border=False):
+        edit_member = st.selectbox("수정 담당자", member_ids,
+                                   index=member_ids.index(int(selected["member_id"])) if int(selected["member_id"]) in member_ids else 0,
+                                   format_func=member_names.get,
+                                   key=f"schedule_member_edit_{project['id']}_{selected_id}")
+        edit_date = st.date_input("수정 업무 날짜", value=selected["work_date"] or today(),
+                                  key=f"schedule_edit_date_{project['id']}_{selected_id}")
+        if st.form_submit_button("일정 수정 저장"):
+            try:
+                db.save_version_task_schedule(project["id"], edit_phase, edit_detail, edit_member,
+                                              edit_date, schedule_id=selected_id)
+                st.success("세부 업무 일정을 수정했습니다.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"일정을 수정하지 못했습니다: {exc}")
+    if st.button("선택 일정 삭제", key=f"delete_version_task_schedule_{project['id']}_{selected_id}"):
+        db.delete_version_task_schedule(project["id"], selected_id)
+        st.success("세부 업무 일정을 삭제했습니다.")
+        st.rerun()
 
 
 def _render_phase(project, team, phase):
@@ -272,7 +358,7 @@ def _render_recommendations(project, team, allow_approval=True):
                 st.error("과거 처리 이력 기준으로 일부 배정이 처리 능력을 초과합니다. 추가 인력 또는 일정 조정 검토가 필요합니다.")
             elif not result["history_available"]:
                 st.info("과거 시트 또는 T0800 이상 내부 기록이 쌓이면 담당자별 과거 처리량을 이용해 마감 가능성을 더 정확하게 계산합니다.")
-            consent = st.checkbox("추천 요약을 LLM으로 다듬기 (버전·배정 수량·팀원명이 사내 LLM 서버로 전송됨)",
+            consent = st.toggle("추천 요약을 LLM으로 다듬기 (버전·배정 수량·팀원명이 사내 LLM 서버로 전송됨)",
                                   key=f"llm_recommend_consent_{phase}_{project['id']}")
             if consent and st.button("AI 설명 만들기", key=f"llm_recommend_{phase}_{project['id']}"):
                 if not llm.llm_available():
@@ -286,8 +372,8 @@ def _render_recommendations(project, team, allow_approval=True):
                                                f"버전: {project['version']}\n마감: {result['due']}\n추천 데이터:\n{facts}")
                     st.write(explanation or answer)
             if allow_approval:
-                approved = st.checkbox("추천안을 확인했고 이 배정으로 확정합니다.", key=f"approve_recommend_{phase}_{project['id']}")
-                if st.button("PM 승인 배정 저장", disabled=not approved, key=f"save_assignments_{phase}_{project['id']}"):
+                approved = st.toggle("추천안을 확인했고 이 배정으로 확정합니다.", key=f"approve_recommend_{phase}_{project['id']}")
+                if st.button("승인 배정 저장", type="primary", disabled=not approved, key=f"save_assignments_{phase}_{project['id']}"):
                     db.replace_version_assignments(project["id"], phase, result["rows"])
                     st.cache_data.clear()
                     st.success("PM 승인 배정을 저장했습니다.")
@@ -302,7 +388,13 @@ def _render_recommendations(project, team, allow_approval=True):
 
 
 def _render_pm_review_flow(project, stage):
-    st.subheader("PM 검토 완료 처리")
+    with st.container(border=True):
+        st.markdown("### PM 검토 단계")
+        st.caption("요구사양서 작성 검토를 완료한 뒤 동적 검증 검토를 진행합니다.")
+        _render_pm_review_controls(project, stage)
+
+
+def _render_pm_review_controls(project, stage):
     spec_total, spec_done = stage["spec"]
     spec_complete = spec_total > 0 and spec_done >= spec_total
     verify = stage["verify"]
@@ -364,29 +456,35 @@ def _render_pm_review_flow(project, stage):
 
 def render(team, rules=None):
     header("🗓️ (PM) 검증 일정 관리", "PM이 버전별 요구사양서 작성·동적 검증 목표와 마감일을 관리합니다. 실제 기록은 검증 업무 기록에서 입력합니다.")
-    _create_version_form()
     projects = [p for p in db.list_version_projects() if is_internal_version(p["version"])]
-    if not projects:
-        st.info("등록된 버전이 없습니다. 새 버전을 생성하세요.")
-        return
     by_id = {int(p["id"]): p for p in projects}
-    selected_id = st.selectbox("버전", list(by_id), format_func=lambda pid: by_id[pid]["version"], key="internal_version_pick")
+    created_project_id = st.session_state.pop("internal_version_pick_after_create", None)
+    if created_project_id in by_id:
+        st.session_state["internal_version_pick"] = created_project_id
+    new_version_option = "새 버전 및 마감일 등록"
+    selected_id = st.selectbox("버전", [new_version_option, *by_id],
+                               format_func=lambda value: new_version_option if value == new_version_option else by_id[value]["version"],
+                               key="internal_version_pick")
+    if selected_id == new_version_option:
+        _new_version_deadline_form()
+        return
     project = db.get_version_project(selected_id)
-    st.subheader("\uC5C5\uBB34 \uC9C4\uD589 \uD604\uD669")
     stage = workflow_stage(project)
-    st.info(stage["message"])
-    spec_total, spec_done = stage["spec"]
-    verify_requirements = stage["verify"]["requirements"]
-    verify_functions = stage["verify"]["functions"]
-    step_cols = st.columns(3)
-    step_cols[0].metric("\uC694\uAD6C\uC0AC\uC591\uC11C \uC791\uC131", f"{min(spec_done, spec_total)} / {spec_total}" if spec_total else "\uACC4\uD68D \uBBF8\uB4F1\uB85D")
-    step_cols[1].metric("\uB3D9\uC801 \uAC80\uC99D \uB300\uC0C1 \uC694\uAD6C\uC0AC\uC591\uC11C", verify_requirements[0])
-    step_cols[2].metric("\uB3D9\uC801 \uAC80\uC99D \uB300\uC0C1 \uD568\uC218", verify_functions[0])
-    st.caption(f"요구사양서 작성 전체 일감: {project['spec_total_items']} · 동적 검증 등록 전체 요구사양서: {project['verify_spec_total_items']}")
-    split_history = [h for h in db.version_project_history(project["id"])
-                     if h["field"] == "verify_spec_total_items" and str(h.get("new_value", "")).startswith("0 — 기존 공용값 분리")]
-    if split_history:
-        st.info("이전 화면에서 공용으로 쓰던 동적 검증 사양서 수는 변경 이력에 보관했습니다. 실제 동적 검증 목표 수를 별도 입력하세요.")
+    with st.container(border=True):
+        st.markdown("### 업무 진행 현황")
+        st.info(stage["message"])
+        spec_total, spec_done = stage["spec"]
+        verify_requirements = stage["verify"]["requirements"]
+        verify_functions = stage["verify"]["functions"]
+        step_cols = st.columns(3)
+        step_cols[0].metric("요구사양서 작성", f"{min(spec_done, spec_total)} / {spec_total}" if spec_total else "계획 미등록")
+        step_cols[1].metric("동적 검증 대상 요구사양서", verify_requirements[0])
+        step_cols[2].metric("동적 검증 대상 함수", verify_functions[0])
+        st.caption(f"요구사양서 작성 전체 일감: {project['spec_total_items']} · 동적 검증 등록 전체 요구사양서: {project['verify_spec_total_items']}")
+        split_history = [h for h in db.version_project_history(project["id"])
+                         if h["field"] == "verify_spec_total_items" and str(h.get("new_value", "")).startswith("0 — 기존 공용값 분리")]
+        if split_history:
+            st.info("이전 화면에서 공용으로 쓰던 동적 검증 사양서 수는 변경 이력에 보관했습니다. 실제 동적 검증 목표 수를 별도 입력하세요.")
     _render_pm_review_flow(project, stage)
     if WORKLOG_PAGE is not None:
         def open_worklog(version):
@@ -394,10 +492,17 @@ def render(team, rules=None):
             st.switch_page(WORKLOG_PAGE)
         st.button("선택 버전의 전체 업무 로그 보기 →", key=f"internal_worklog_link_{selected_id}",
                   on_click=open_worklog, args=(project["version"],))
-    tabs = st.tabs(["일정 및 사전 물량", "요구사양서 작성", "동적 검증"])
-    with tabs[0]:
-        _schedule_and_workload(project)
-    with tabs[1]:
-        _render_phase(project, team, "spec")
-    with tabs[2]:
-        _render_phase(project, team, "verify")
+    with st.container(key="planning_area_shell"):
+        st.markdown("## 일정 관리 영역")
+        st.caption("일정과 사전 물량을 관리하거나, 업무 단계별 진척 내용을 확인합니다.")
+        planning_view = st.segmented_control(
+            "일정 관리 영역", ["일정 및 사전 물량", "요구사양서 작성", "동적 검증"],
+            selection_mode="single", default="일정 및 사전 물량",
+            key=f"planning_view_{selected_id}", width="stretch",
+            label_visibility="collapsed") or "일정 및 사전 물량"
+        if planning_view == "일정 및 사전 물량":
+            _schedule_and_workload(project, team)
+        elif planning_view == "요구사양서 작성":
+            _render_phase(project, team, "spec")
+        else:
+            _render_phase(project, team, "verify")

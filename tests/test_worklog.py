@@ -272,16 +272,30 @@ class DbAndIntegrationTests(unittest.TestCase):
         # CSV의 이름이 샘플 팀원 이름과 달라 0건일 수 있으므로 직접 엔트리 구성
         ents = [{"track": "dynamic", "date": date(2026, 10, 19), "member_id": 4, "version": "v1", "subsystem": "Audio", "category": "c", "req": 3, "tc": 20, "func": 9, "row": 2}]
         self.assertEqual(db.replace_logs("시트A", ents, self.path), {"removed": 0, "added": 1, "ignored_internal": 0})
-        self.assertEqual(db.replace_logs("시트A", ents + ents, self.path), {"removed": 1, "added": 2, "ignored_internal": 0})   # 교체(누적 아님)
+        self.assertEqual(db.replace_logs("시트A", ents + ents, self.path), {"removed": 0, "added": 0, "ignored_internal": 0})
         t = db.load_team_data(self.path)
-        self.assertEqual(int((t.logs["source"] == "시트A").sum()), 2)
-        self.assertEqual(len(t.logs), n_sample + 2)
-        self.assertEqual(int(t.logs[t.logs["source"] == "시트A"]["func"].sum()), 18)
+        self.assertEqual(int((t.logs["source"] == "시트A").sum()), 1)
+        self.assertEqual(len(t.logs), n_sample + 1)
+        self.assertEqual(int(t.logs[t.logs["source"] == "시트A"]["func"].sum()), 9)
         self.assertEqual(set(t.logs[t.logs["source"] == "시트A"]["subsystem"]), {"Audio"})
         db.delete_logs("샘플", self.path)
         self.assertEqual(set(db.load_team_data(self.path).logs["source"]), {"시트A"})
         db.delete_member(4, self.path)
         self.assertEqual(len(db.load_team_data(self.path).logs), 0)
+
+    def test_legacy_import_caps_at_t0700_and_keeps_import_idempotent(self):
+        db.init_db(self.path)
+        entries = [
+            {"track": "dynamic", "date": date(2026, 10, 19), "member_id": 4, "version": "T0700", "func": 2, "row": 2},
+            {"track": "dynamic", "date": date(2026, 10, 20), "member_id": 4, "version": "T0800", "func": 3, "row": 3},
+            {"track": "dynamic", "date": date(2026, 10, 21), "member_id": 4, "version": "", "func": 4, "row": 4},
+        ]
+        result = db.replace_logs("legacy", entries, self.path, max_legacy_version=700)
+        self.assertEqual((result["added"], result["ignored_internal"], result["ignored_out_of_scope"]), (1, 1, 1))
+        result = db.replace_logs("legacy", entries, self.path, max_legacy_version=700)
+        self.assertEqual((result["added"], result["updated"]), (0, 1))
+        saved = db.load_team_data(self.path).logs
+        self.assertEqual(set(saved[saved["source"] == "legacy"]["version"]), {"T0700"})
 
     def test_migration_creates_work_logs_on_old_db(self):
         c = sqlite3.connect(self.path)

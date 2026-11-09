@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import re
 import urllib.error
 import urllib.request
@@ -12,6 +13,7 @@ from datetime import date, timedelta
 
 from .mail_digest import parse_date
 from .models import UNIT_SKILL, TeamData, isnull, required_skills, today
+from . import llm_client
 
 
 class SheetError(Exception):
@@ -59,6 +61,276 @@ def fetch_csv(ref: str, gid, timeout: int = 20) -> str:
     if "text/html" in ctype or text.lstrip().lower().startswith(("<!doctype html", "<html")):
         raise SheetError("CSV 대신 로그인/오류 페이지가 반환되었습니다. 공유 설정을 확인하거나 CSV 업로드를 사용하세요.")
     return text
+
+
+def discover_sheet_tabs(ref: str, timeout: int = 15) -> list[dict]:
+    """공개 스프레드시트의 gid를 찾아 탭 선택 목록을 만든다. 인증/비공개 시트는 지원하지 않는다."""
+    sheet_id = extract_sheet_id(ref)
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 VACON"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            page = response.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise SheetError(f"Google Sheets 탭 목록을 읽을 수 없습니다: {getattr(exc, 'reason', exc)}") from None
+    if "accounts.google.com" in page or "ServiceLogin" in page:
+        raise SheetError("로그인이 필요한 비공개 시트입니다. 공개 읽기 권한 또는 CSV 내보내기가 필요합니다.")
+    gids = list(dict.fromkeys(re.findall(r"(?:gid(?:%3D|=)|\"sheetId\"\s*:\s*)(\d+)", page)))
+    if not gids:
+        raise SheetError("시트 탭 GID를 찾지 못했습니다. 시트 공개 권한을 확인하거나 탭 주소의 gid를 입력하세요.")
+    # Tab titles are not consistently embedded in Google's public HTML. Keep a clear
+    # GID label when the title cannot be extracted; never guess a tab's role.
+    return [{"label": f"시트 탭 (gid {gid})", "gid": gid} for gid in gids]
+
+
+LOG_MAPPING_FIELDS = {
+    "dynamic": {"date": "날짜", "member": "담당자", "version": "버전", "subsystem": "서브시스템",
+                "category": "업무 구분", "req": "완료 요구사양서", "func": "완료 함수", "defect": "결함",
+                "tc": "실행 TC", "tc_created": "생성 TC", "tc_modified": "수정 TC", "tc_deleted": "삭제 TC", "notes": "특이사항"},
+    "req": {"date": "날짜", "member": "담당자", "version": "버전", "subsystem": "서브시스템",
+             "category": "업무 구분", "issue": "완료 일감", "new_req": "신규 요구사양", "modified_req": "수정 요구사양",
+             "deleted_req": "삭제 요구사양", "notes": "특이사항"},
+}
+
+
+def analyze_log_mapping(rows: list[list[str]], track: str | None = None) -> dict:
+    """헤더와 제한된 샘플을 ALIRA에 보내 업무 로그 열 매핑을 제안한다."""
+    from .worklog import col_index, col_letter
+
+    if track is not None and track not in LOG_MAPPING_FIELDS:
+        raise SheetError("AI 열 자동 매핑은 요구사양서 작성/동적 검증 로그만 지원합니다.")
+    if not llm_client.configured():
+        raise SheetError("ALIRA_API_BASE와 ALIRA_MODEL 설정이 필요합니다.")
+    fields = LOG_MAPPING_FIELDS[track] if track else {**LOG_MAPPING_FIELDS["dynamic"], **LOG_MAPPING_FIELDS["req"]}
+    payload = {"requested_business_type": track or "자동 판별(dynamic 또는 req)",
+               "target_fields": fields, "sheet_rows": rows[:30]}
+    prompt = ("Google Sheets CSV의 헤더 행과 내용 샘플을 분석해 VACON 업무 로그 열을 매핑하세요. "
+              "업무 유형이 지정되지 않았다면 business_type을 dynamic(동적 검증), req(요구사양서 작성), other(관련 없음) 중 하나로 판별하세요. "
+              "날짜, 담당자는 실제 헤더를 근거로 지정하고, 숫자 지표는 값의 의미가 분명할 때만 지정하세요. "
+              "헤더행 번호는 1부터 세세요. 모르는 값은 null로 두고 추측하지 마세요. "
+              "JSON만 반환: {\"business_type\":\"dynamic, req 또는 other\",\"header_row\":1,\"mapping\":{\"date\":\"실제 헤더\",...},\"confidence\":0.0,\"reason\":\"...\"}. "
+              "mapping 키는 target_fields의 키만 사용하고 값은 시트 헤더 문자열이어야 합니다.\n" +
+              json.dumps(payload, ensure_ascii=False))
+    try:
+        message = llm_client.chat([{"role": "system", "content": "시트 구조 매핑 도우미입니다. 제공된 표본 외의 사실을 만들지 마세요."},
+                                   {"role": "user", "content": prompt}], max_tokens=900, timeout=35)
+    except Exception as exc:
+        raise SheetError(f"ALIRA 시트 분석에 실패했습니다: {exc}") from None
+    content = llm_client.strip_reasoning(message.get("content"))
+    content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.I)
+    try:
+        result = json.loads(content)
+    except (TypeError, json.JSONDecodeError):
+        raise SheetError("ALIRA 응답에서 JSON 매핑을 해석하지 못했습니다. 다시 분석하거나 수동 확인하세요.") from None
+    resolved_track = track or str(result.get("business_type") or "").strip().lower()
+    if resolved_track == "other":
+        return {"track": "other", "header_row": None, "columns": {}, "missing_required": [],
+                "confidence": 0.0, "reason": str(result.get("reason") or "업무 로그 탭이 아닙니다.")[:500], "headers": []}
+    if resolved_track not in LOG_MAPPING_FIELDS:
+        raise SheetError("ALIRA가 이 탭을 요구사양서/동적 검증 로그로 분류하지 못했습니다. 업무 유형을 확인하세요.")
+    fields = LOG_MAPPING_FIELDS[resolved_track]
+    try:
+        header_row = int(result.get("header_row"))
+    except (TypeError, ValueError):
+        raise SheetError("ALIRA가 헤더 행을 확정하지 못했습니다. 원본을 확인하세요.") from None
+    if not 1 <= header_row <= min(30, len(rows)):
+        raise SheetError("ALIRA가 데이터 범위 밖의 헤더 행을 반환했습니다.")
+    headers = [str(value).strip() for value in rows[header_row - 1]]
+    data_rows = rows[header_row:]
+    def legacy_version(value):
+        match = re.fullmatch(r"\s*T\s*0*(\d+)\s*", str(value or ""), re.I)
+        return bool(match and int(match.group(1)) <= 700)
+
+    mapping = {}
+    for field, header in (result.get("mapping") or {}).items():
+        if field not in fields or not isinstance(header, str) or not header.strip():
+            continue
+        matches = [index for index, actual in enumerate(headers) if actual == header.strip()]
+        if len(matches) == 1:
+            mapping[field] = col_letter(matches[0])
+        elif len(matches) > 1 and field == "version":
+            # Repeated "버전" headers can include a separate T0800 planning block.
+            scores = [(sum(legacy_version(row[i] if i < len(row) else "") for row in data_rows), i)
+                      for i in matches]
+            best = max(score for score, _ in scores)
+            winners = [i for score, i in scores if score == best and score > 0]
+            if len(winners) == 1:
+                mapping[field] = col_letter(winners[0])
+        elif len(matches) > 1 and field == "subsystem" and mapping.get("version"):
+            version_index = col_index(mapping["version"])
+            scores = []
+            for index in matches:
+                count = sum(legacy_version(row[version_index] if version_index < len(row) else "")
+                            and bool(str(row[index] if index < len(row) else "").strip())
+                            for row in data_rows)
+                scores.append((count, index))
+            best = max(score for score, _ in scores)
+            winners = [i for score, i in scores if score == best and score > 0]
+            if len(winners) == 1:
+                mapping[field] = col_letter(winners[0])
+
+    # "버전" is required to enforce the T0700 ingestion limit. Recover it from
+    # actual header values when the AI output omitted or could not disambiguate it.
+    if "version" not in mapping:
+        version_headers = [i for i, name in enumerate(headers)
+                           if re.sub(r"\s+", "", name).casefold() in {"버전", "version"}]
+        scores = [(sum(legacy_version(row[i] if i < len(row) else "") for row in data_rows), i)
+                  for i in version_headers]
+        best = max((score for score, _ in scores), default=0)
+        winners = [i for score, i in scores if score == best and score > 0]
+        if len(winners) == 1:
+            mapping["version"] = col_letter(winners[0])
+    required_metrics = {"req", "func"} if resolved_track == "dynamic" else {"issue"}
+    required = {"date", "member", "version"}
+    missing = sorted((required | required_metrics) - mapping.keys())
+    confidence = result.get("confidence")
+    try:
+        confidence = max(0.0, min(1.0, float(confidence)))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return {"track": resolved_track, "header_row": header_row, "columns": mapping, "missing_required": missing,
+            "confidence": confidence, "reason": str(result.get("reason") or "")[:500], "headers": headers}
+
+
+SHEET_TASK_DETAILS = {
+    "req": ("사양서 작성", "일감 정리", "산출물 검토", "업무 구분"),
+    "dynamic": ("동적 검증", "검증데이터 세팅", "결과보고서 세팅", "산출물 검토"),
+}
+
+
+def classify_worklog_categories(entries: list[dict], track: str) -> tuple[dict[str, tuple[str, str]], str | None]:
+    """Classify actual D-column labels and ask ALIRA only about unclear labels."""
+    from .worklog import classify_sheet_task
+
+    labels = sorted({str(entry.get("category") or "").strip() for entry in entries
+                     if str(entry.get("category") or "").strip()})
+    if not labels:
+        return {}, "시트에 업무 구분 값이 없어 세부 업무를 자동 분류하지 않았습니다."
+    mapping = {label: classify_sheet_task(label, track) for label in labels}
+    unclear = [label for label in labels if mapping[label][1] == label]
+    if not unclear:
+        return mapping, None
+    if not llm_client.configured():
+        return mapping, "ALIRA 연결이 없어 일부 미분류 업무 구분은 원본 값 그대로 보존했습니다."
+    prompt = (
+        "다음 문자열은 구글 시트 D열의 실제 업무 구분 값입니다. 탭 종류와 무관하게 각 값의 의미로 "
+        "VACON 업무 유형과 세부 업무를 판단하세요. 허용된 유형/세부 업무 쌍 중 근거가 명확한 경우만 반환하고, "
+        "불명확하면 null로 반환하세요. 서브시스템 값은 업무 유형 판단 근거로 사용하지 마세요.\n"
+        + json.dumps({"source_tab_type": track, "allowed": {
+            "요구사양서 작성": SHEET_TASK_DETAILS["req"], "동적 검증": SHEET_TASK_DETAILS["dynamic"]},
+            "D_column_values": unclear}, ensure_ascii=False)
+        + '\nJSON만 반환: {"mapping":{"원본값":{"business_type":"req 또는 dynamic","task_detail":"허용 세부 업무"}}}'
+    )
+    try:
+        response = llm_client.chat([
+            {"role": "system", "content": "시트의 업무 구분 값만 분류합니다. 제공되지 않은 데이터를 만들지 마세요."},
+            {"role": "user", "content": prompt},
+        ], max_tokens=500, timeout=35)
+        content = llm_client.strip_reasoning(response.get("content"))
+        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.I)
+        parsed = json.loads(content)
+        proposed = parsed.get("mapping", {})
+        for source, result in proposed.items():
+            if source not in unclear or not isinstance(result, dict):
+                continue
+            business_type = str(result.get("business_type") or "").strip().lower()
+            task_detail = str(result.get("task_detail") or "").strip()
+            if business_type in SHEET_TASK_DETAILS and task_detail in SHEET_TASK_DETAILS[business_type]:
+                mapping[source] = (business_type, task_detail)
+        return mapping, None
+    except Exception as exc:
+        return mapping, f"ALIRA 세부 업무 분류에 실패해 일부 시트 원본 업무 구분을 보존했습니다: {exc}"
+
+
+def analyze_worklog_sheets(sheets: list[dict], team: TeamData) -> dict:
+    """여러 탭을 유형 판별·매핑·로그 파싱하고, 확인이 필요한 항목을 함께 반환한다."""
+    from . import worklog
+
+    results, entries, problems, warnings, unmatched = [], [], [], [], set()
+    total_skipped = total_text_cells = total_unassigned = excluded_versions = 0
+    expected_tabs = {"2.dynamic_verification": "dynamic", "3.req_creation_wbs": "req"}
+    seen_tabs = set()
+    for sheet in sheets:
+        label, rows = str(sheet["label"]), sheet["rows"]
+        title = re.sub(r"\s+", " ", str(sheet.get("title") or label)).strip().casefold()
+        title_key = re.sub(r"\s+", "", title)
+        expected_track = sheet.get("expected_track") or expected_tabs.get(title_key)
+        if expected_track is None:
+            continue
+        if expected_track not in LOG_MAPPING_FIELDS:
+            problems.append(f"{label} (업무 유형 설정 오류)")
+            continue
+        seen_tabs.add(expected_track)
+        if not rows or not any(str(cell).strip() for row in rows for cell in row):
+            problems.append(label + " (시트에 읽을 데이터가 없음)")
+            continue
+        analysis = analyze_log_mapping(rows, expected_track)
+        item = {"label": label, **analysis}
+        results.append(item)
+        if analysis["missing_required"] or analysis["confidence"] < 0.6:
+            problems.append(label + (" (필수 열 미확인: " + ", ".join(analysis["missing_required"]) + ")"
+                                     if analysis["missing_required"] else " (분석 신뢰도 낮음)"))
+            continue
+        role = "log_dynamic" if analysis["track"] == "dynamic" else "log_req"
+        config = {"role": role, "header_row": analysis["header_row"], "columns": analysis["columns"],
+                  "headers": {field: analysis["headers"][worklog.col_index(letter)]
+                              for field, letter in analysis["columns"].items()},
+                  "fill_down": False}
+        output = worklog.parse_logs(_rows_to_csv(rows), config, team)
+        item["parsed"] = output
+        in_scope = []
+        for entry in output["entries"]:
+            match = re.fullmatch(r"\s*T\s*0*(\d+)\s*", str(entry.get("version") or ""), re.I)
+            if not match or int(match.group(1)) > 700:
+                excluded_versions += 1
+                continue
+            number = int(match.group(1))
+            entry["version"] = f"T{number:04d}"
+            in_scope.append(entry)
+        category_map, category_warning = classify_worklog_categories(in_scope, analysis["track"])
+        if category_map:
+            for entry in in_scope:
+                raw_category = str(entry.get("category") or "").strip()
+                if raw_category in category_map:
+                    entry["track"], entry["category"] = category_map[raw_category]
+        item["parsed"] = {**output, "entries": in_scope}
+        if category_warning:
+            warnings.append(f"{label}: {category_warning}")
+        item["accepted_records"] = len(in_scope)
+        item["excluded_records"] = len(output["entries"]) - len(in_scope)
+        if not in_scope:
+            details = []
+            if output["unmatched_members"]:
+                details.append("팀원 미일치: " + ", ".join(output["unmatched_members"][:8]))
+            if output["diag"].get("bad_date_rows"):
+                details.append(f"날짜 해석 실패 {output['diag']['bad_date_rows']}행")
+            if output["skipped"] and not details:
+                details.append(f"행 건너뜀 {output['skipped']}건")
+            problems.append(label + " (T0700 이하로 반영할 수 있는 기록 0건" +
+                            (" · " + " · ".join(details) if details else "") + ")")
+        entries.extend({**entry, "source": label} for entry in in_scope)
+        warnings.extend(f"{label}: {warning}" for warning in output["warnings"])
+        unmatched.update(output["unmatched_members"])
+        total_skipped += output["skipped"]
+        total_text_cells += output["text_cells"]
+        total_unassigned += output["diag"].get("unassigned_rows", 0)
+    missing_tabs = set(LOG_MAPPING_FIELDS) - seen_tabs
+    if missing_tabs:
+        names = {"dynamic": "2. Dynamic_Verification", "req": "3. Req_Creation_WBS"}
+        problems.append("필수 시트 누락: " + ", ".join(names[key] for key in sorted(missing_tabs)))
+    if excluded_versions:
+        warnings.append(f"T0700 이후 또는 버전이 불명확한 기록 {excluded_versions}건은 반영 대상에서 제외했습니다.")
+    return {"sheets": results, "entries": entries, "problems": problems, "warnings": warnings,
+            "unmatched_members": sorted(unmatched), "skipped": total_skipped, "text_cells": total_text_cells,
+            "unassigned_rows": total_unassigned, "excluded_versions": excluded_versions,
+            "ready": bool(entries) and not problems}
+
+
+def _rows_to_csv(rows: list[list[str]]) -> str:
+    stream = io.StringIO()
+    writer = csv.writer(stream)
+    writer.writerows(rows)
+    return stream.getvalue()
 
 
 def read_table(text: str, header_row: int = 1) -> tuple[list[str], list[dict]]:

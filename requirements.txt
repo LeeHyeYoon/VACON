@@ -1,7 +1,11 @@
 streamlit>=1.40
 pandas>=2.0
+openpyxl>=3.1
+google-api-python-client>=2.0
+google-auth>=2.0
+google-auth-oauthlib>=1.0
 plotly>=5.20
 pytest>=8.0
 pywin32>=306; platform_system == "Windows"
-# pywin32는 그룹웨어 로그인 정보를 현재 Windows 계정 DPAPI로 보호할 때만 사용합니다.
+# pywin32는 그룹웨어 및 Google OAuth 정보를 현재 Windows 계정 DPAPI로 보호할 때 사용합니다.
 # AI Agent 및 LLM 문장화는 사내 ALIRA API를 표준 라이브러리로 호출합니다.

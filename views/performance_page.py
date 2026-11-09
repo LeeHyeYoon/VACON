@@ -44,7 +44,9 @@ def _phase(project, team, phase):
                 next_step = "현재 등록된 동적 검증 목표는 모두 완료되었습니다."
             st.info(workflow["message"] + " · " + next_step)
             return
-    action = st.radio("기록 작업", ["신규 기록", "기록 수정/삭제"], horizontal=True, key=f"perf_action_{phase}_{project['id']}")
+    action = st.segmented_control(
+        "기록 작업", ["신규 기록", "기록 수정/삭제"], selection_mode="single",
+        default="신규 기록", key=f"perf_action_{phase}_{project['id']}", width="content")
     selected = None
     if action == "기록 수정/삭제":
         if not records: st.info("수정할 기록이 없습니다."); return
@@ -149,16 +151,21 @@ def _phase(project, team, phase):
         key=subsystem_key)
     with st.form(f"perf_form_{phase}_{project['id']}_{suffix}"):
         st.caption(f"선택: {entry_date} · {team.name(member_id)} · {subsystem}")
-        fields = {"date": entry_date, "member_id": member_id, "subsystem": subsystem}; cols = st.columns(2)
+        task_detail = st.selectbox("세부 업무", db.ACTUAL_TASK_DETAILS[phase],
+                                   index=(db.ACTUAL_TASK_DETAILS[phase].index(defaults["task_detail"])
+                                          if defaults.get("task_detail") in db.ACTUAL_TASK_DETAILS[phase] else 0),
+                                   key=f"perf_detail_{phase}_{project['id']}_{suffix}")
+        fields = {"date": entry_date, "member_id": member_id, "subsystem": subsystem,
+                  "task_detail": task_detail}; cols = st.columns(2)
         for i, (metric, label) in enumerate(phase_fields): fields[metric] = cols[i % 2].number_input(label, min_value=0, value=int(defaults.get(metric, 0) or 0), step=1, key=f"perf_{metric}_{phase}_{project['id']}_{suffix}")
         fields["notes"] = st.text_area("특이사항", value=defaults.get("notes", ""), key=f"perf_notes_{phase}_{project['id']}_{suffix}")
         if st.form_submit_button("업무 실적 수정" if selected else "업무 실적 저장"):
             db.save_version_worklog(project["id"], phase, fields, log_id=selected["id"] if selected else None); st.cache_data.clear(); st.success("업무 실적을 저장했습니다."); st.rerun()
-    if selected and st.button("선택한 업무 실적 삭제", key=f"perf_delete_{phase}_{project['id']}_{selected['id']}"):
+    if selected and st.button("선택한 업무 실적 삭제", type="tertiary", key=f"perf_delete_{phase}_{project['id']}_{selected['id']}"):
         db.delete_version_worklog(project["id"], phase, selected["id"]); st.cache_data.clear(); st.success("업무 실적을 삭제했습니다."); st.rerun()
     if records:
-        cols = ["date", "member_name", "subsystem", *[k for k, _ in phase_fields], "notes", "created_at", "updated_at"]
-        history = pd.DataFrame(records)[cols].rename(columns={"date": "업무 수행 날짜", "member_name": "담당자", "subsystem": "서브시스템", "notes": "특이사항", "created_at": "등록 시각", "updated_at": "수정 시각"})
+        cols = ["date", "member_name", "subsystem", "task_detail", *[k for k, _ in phase_fields], "notes", "created_at", "updated_at"]
+        history = pd.DataFrame(records)[cols].rename(columns={"date": "업무 수행 날짜", "member_name": "담당자", "subsystem": "서브시스템", "task_detail": "세부 업무", "notes": "특이사항", "created_at": "등록 시각", "updated_at": "수정 시각"})
         show_df(history)
 def render(team, rules=None):
     header("✍️ 검증 업무 기록", "완료한 업무를 날짜별로 기록합니다. 요구사양서 작성과 동적 검증은 별도로 저장됩니다.")
@@ -169,6 +176,8 @@ def render(team, rules=None):
     with st.expander("담당자별 업무·서브시스템 추천", expanded=False):
         st.caption("과거 버전의 해당 업무·서브시스템 기록, 최근 30일 작성·검증 실적, 현재 계획·승인 배정, 등록된 업무량, 마감일과 부재를 반영한 검토용 추천입니다. 추천은 실적이나 배정으로 저장되지 않습니다.")
         _render_recommendations(project, team, allow_approval=False)
-    spec_tab, verify_tab = st.tabs(["요구사양서 작성 실적", "동적 검증 실적"])
-    with spec_tab: _phase(project, team, "spec")
-    with verify_tab: _phase(project, team, "verify")
+    with st.container(border=True, key="performance_work_record_shell"):
+        st.markdown("### 업무 실적 등록")
+        spec_tab, verify_tab = st.tabs(["요구사양서 작성 실적", "동적 검증 실적"])
+        with spec_tab: _phase(project, team, "spec")
+        with verify_tab: _phase(project, team, "verify")

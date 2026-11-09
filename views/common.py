@@ -3,16 +3,20 @@ from __future__ import annotations
 
 import pandas as pd
 import streamlit as st
+import re
 
 from services.risk import HIGH, INSUFFICIENT, LOW, MEDIUM, format_reasons
 
 LEVEL_COLORS = {HIGH: "#E5484D", MEDIUM: "#F5A524", LOW: "#30A46C", INSUFFICIENT: "#8B8D98"}
-BADGE = {HIGH: "🔴 High", MEDIUM: "🟠 Medium", LOW: "🟢 Low", INSUFFICIENT: "⚪ 데이터 부족"}
+BADGE = {HIGH: "높음", MEDIUM: "보통", LOW: "낮음", INSUFFICIENT: "평가 불가"}
 WEEKDAY = "월화수목금토일"
 
 
 def header(title: str, caption: str = "") -> None:
-    st.title(title)
+    # Older screens passed emoji prefixes; keep the shared page heading typographic.
+    clean_title = re.sub(r"^(?:[\U0001F300-\U0001FAFF\u2600-\u27BF]\ufe0f?\s*)+", "", title)
+    st.caption("VACON · 업무와 휴가를 잇는 AI 관리 플랫폼")
+    st.title(clean_title)
     if caption:
         st.caption(caption)
 
@@ -36,7 +40,7 @@ def risk_table(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 
 
 def show_df(df: pd.DataFrame) -> None:
-    st.dataframe(df, hide_index=True)
+    st.dataframe(df, hide_index=True, width="stretch", alt="업무 현황 및 기록 표")
 
 
 def errors_box(errors: list[str]) -> bool:

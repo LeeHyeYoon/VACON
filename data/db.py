@@ -18,7 +18,8 @@ DEFAULT_DB = Path(__file__).parent / "vacon.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS members(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
-    role TEXT DEFAULT '', workload INTEGER DEFAULT 0, contact TEXT DEFAULT '', mbti TEXT DEFAULT '');
+    role TEXT DEFAULT '', workload INTEGER DEFAULT 0, contact TEXT DEFAULT '', mbti TEXT DEFAULT '',
+    certifications TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS skills(member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
     skill TEXT NOT NULL, level INTEGER DEFAULT 1, PRIMARY KEY(member_id, skill));
 CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
@@ -64,6 +65,17 @@ CREATE TABLE IF NOT EXISTS version_history(
     field TEXT NOT NULL, old_value TEXT, new_value TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_version_history_project ON version_history(project_id, changed_at);
+CREATE TABLE IF NOT EXISTS version_task_schedules(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES version_projects(id) ON DELETE CASCADE,
+    phase TEXT NOT NULL CHECK(phase IN ('spec','verify')),
+    task_detail TEXT NOT NULL,
+    member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+    work_date TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_version_task_schedules_date ON version_task_schedules(project_id,work_date,phase);
 CREATE TABLE IF NOT EXISTS version_subsystems(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id INTEGER NOT NULL REFERENCES version_projects(id) ON DELETE CASCADE,
@@ -100,6 +112,7 @@ CREATE TABLE IF NOT EXISTS spec_work_logs(
     new_requirements INTEGER NOT NULL DEFAULT 0 CHECK(new_requirements >= 0),
     modified_requirements INTEGER NOT NULL DEFAULT 0 CHECK(modified_requirements >= 0),
     deleted_requirements INTEGER NOT NULL DEFAULT 0 CHECK(deleted_requirements >= 0),
+    task_detail TEXT NOT NULL DEFAULT '',
     notes TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -118,6 +131,7 @@ CREATE TABLE IF NOT EXISTS version_dynamic_work_logs(
     tc_created INTEGER NOT NULL DEFAULT 0 CHECK(tc_created >= 0),
     tc_modified INTEGER NOT NULL DEFAULT 0 CHECK(tc_modified >= 0),
     tc_deleted INTEGER NOT NULL DEFAULT 0 CHECK(tc_deleted >= 0),
+    task_detail TEXT NOT NULL DEFAULT '',
     notes TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -198,6 +212,8 @@ def _migrate(c) -> None:
         c.execute("ALTER TABLE tasks ADD COLUMN source TEXT DEFAULT ''")
     if "mbti" not in cols:
         c.execute("ALTER TABLE members ADD COLUMN mbti TEXT DEFAULT ''")
+    if "certifications" not in cols:
+        c.execute("ALTER TABLE members ADD COLUMN certifications TEXT DEFAULT ''")
     log_cols = {r["name"] for r in c.execute("PRAGMA table_info(work_logs)")}
     if "subsystem" not in log_cols:
         c.execute("ALTER TABLE work_logs ADD COLUMN subsystem TEXT DEFAULT ''")
@@ -217,6 +233,10 @@ def _migrate(c) -> None:
         c.execute("ALTER TABLE version_projects ADD COLUMN verify_owner_ids TEXT NOT NULL DEFAULT '[]'")
     if "spec_total_items" not in vcols:
         c.execute("ALTER TABLE version_projects ADD COLUMN spec_total_items INTEGER NOT NULL DEFAULT 0")
+    for table in ("spec_work_logs", "version_dynamic_work_logs"):
+        log_fields = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
+        if "task_detail" not in log_fields:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN task_detail TEXT NOT NULL DEFAULT ''")
         c.execute("UPDATE version_projects SET spec_total_items=total_items")
         vcols.add("spec_total_items")
     if "verify_spec_total_items" not in vcols:
@@ -432,6 +452,62 @@ def save_version_project(fields: dict, path=None, project_id: int | None = None)
 def version_project_history(project_id, path=None) -> list[dict]:
     with connect(path) as c:
         return [dict(r) for r in c.execute("SELECT * FROM version_history WHERE project_id=? ORDER BY changed_at DESC,id DESC", (project_id,))]
+
+
+VERSION_TASK_DETAILS = {
+    "spec": ("일감 정리", "산출물 검토", "업무 구분"),
+    "verify": ("검증데이터 세팅", "결과보고서 세팅", "산출물 검토"),
+}
+ACTUAL_TASK_DETAILS = {"spec": ("사양서 작성",), "verify": ("동적 검증",)}
+
+
+def list_version_task_schedules(project_id: int | None = None, path=None) -> list[dict]:
+    query = """SELECT s.*,p.version,m.name AS member_name FROM version_task_schedules s
+               JOIN version_projects p ON p.id=s.project_id JOIN members m ON m.id=s.member_id"""
+    params = ()
+    if project_id is not None:
+        query += " WHERE s.project_id=?"
+        params = (int(project_id),)
+    query += " ORDER BY s.work_date,s.phase,s.id"
+    with connect(path) as c:
+        rows = [dict(row) for row in c.execute(query, params)]
+    for row in rows:
+        row["work_date"] = _date(row["work_date"])
+    return rows
+
+
+def save_version_task_schedule(project_id: int, phase: str, task_detail: str, member_id: int,
+                               work_date, schedule_id: int | None = None, path=None) -> int:
+    if phase not in VERSION_TASK_DETAILS:
+        raise ValueError("업무 구분은 요구사양서 작성 또는 동적 검증이어야 합니다.")
+    task_detail = str(task_detail or "").strip()
+    if task_detail not in VERSION_TASK_DETAILS[phase]:
+        raise ValueError("선택한 업무 구분에 해당하지 않는 세부 업무입니다.")
+    if not work_date:
+        raise ValueError("업무 날짜를 입력하세요.")
+    with connect(path) as c:
+        if not c.execute("SELECT 1 FROM version_projects WHERE id=?", (int(project_id),)).fetchone():
+            raise ValueError("버전을 찾을 수 없습니다.")
+        if not c.execute("SELECT 1 FROM members WHERE id=?", (int(member_id),)).fetchone():
+            raise ValueError("담당자를 찾을 수 없습니다.")
+        if schedule_id is None:
+            cur = c.execute("""INSERT INTO version_task_schedules(project_id,phase,task_detail,member_id,work_date)
+                              VALUES (?,?,?,?,?)""",
+                            (int(project_id), phase, task_detail, int(member_id), _iso(work_date)))
+            return int(cur.lastrowid)
+        cur = c.execute("""UPDATE version_task_schedules SET phase=?,task_detail=?,member_id=?,work_date=?,
+                          updated_at=CURRENT_TIMESTAMP WHERE project_id=? AND id=?""",
+                        (phase, task_detail, int(member_id), _iso(work_date), int(project_id), int(schedule_id)))
+        if not cur.rowcount:
+            raise ValueError("수정할 세부 업무 일정을 찾을 수 없습니다.")
+        return int(schedule_id)
+
+
+def delete_version_task_schedule(project_id: int, schedule_id: int, path=None) -> bool:
+    with connect(path) as c:
+        cur = c.execute("DELETE FROM version_task_schedules WHERE project_id=? AND id=?",
+                        (int(project_id), int(schedule_id)))
+        return cur.rowcount > 0
 
 
 def set_version_workflow_status(project_id: int, field: str, value, path=None) -> None:
@@ -677,16 +753,18 @@ def save_version_phase(fields: dict, phase: str, path=None) -> int:
 
 
 # --- 팀원/역량 ---
-def add_member(name, role, workload, contact="", mbti="", path=None) -> int:
+def add_member(name, role, workload, contact="", mbti="", path=None, certifications="") -> int:
     with connect(path) as c:
-        return c.execute("INSERT INTO members(name,role,workload,contact,mbti) VALUES (?,?,?,?,?)",
-                         (name.strip(), role, int(workload), contact, (mbti or "").upper())).lastrowid
+        return c.execute("INSERT INTO members(name,role,workload,contact,mbti,certifications) VALUES (?,?,?,?,?,?)",
+                         (name.strip(), role, int(workload), contact, (mbti or "").upper(),
+                          str(certifications or "").strip())).lastrowid
 
 
-def update_member(member_id, name, role, workload, contact="", mbti="", path=None) -> None:
+def update_member(member_id, name, role, workload, contact="", mbti="", path=None, certifications="") -> None:
     with connect(path) as c:
-        c.execute("UPDATE members SET name=?,role=?,workload=?,contact=?,mbti=? WHERE id=?",
-                  (name.strip(), role, int(workload), contact, (mbti or "").upper(), member_id))
+        c.execute("UPDATE members SET name=?,role=?,workload=?,contact=?,mbti=?,certifications=? WHERE id=?",
+                  (name.strip(), role, int(workload), contact, (mbti or "").upper(),
+                   str(certifications or "").strip(), member_id))
 
 
 def delete_member(member_id, path=None) -> None:
@@ -802,28 +880,65 @@ def apply_sync_plan(plan: dict, label: str, path=None) -> dict:
 
 
 # --- 업무 로그 ---
-def replace_logs(source: str, entries: list[dict], path=None) -> dict:
-    """Replace one sheet source while excluding rows owned by internal versions."""
+def replace_logs(source: str, entries: list[dict], path=None, max_legacy_version: int | None = None) -> dict:
+    """Idempotently merge sheet rows without deleting historical VACON logs."""
     is_internal = lambda value: bool(re.fullmatch(r"T\s*\d+", str(value or "").strip(), re.IGNORECASE)
         and int(re.search(r"\d+", str(value)).group()) >= 800)
-    retained = [e for e in entries if not is_internal(e.get("version"))]
-    ignored_internal = len(entries) - len(retained)
+    def legacy_version_in_scope(value):
+        match = re.fullmatch(r"\s*T\s*0*(\d+)\s*", str(value or ""), re.IGNORECASE)
+        return bool(match and int(match.group(1)) <= max_legacy_version) if max_legacy_version is not None else True
+
+    retained = [e for e in entries if not is_internal(e.get("version")) and legacy_version_in_scope(e.get("version"))]
+    ignored_internal = sum(1 for e in entries if is_internal(e.get("version")))
+    ignored_out_of_scope = len(entries) - len(retained) - ignored_internal
     if entries and not retained:
-        # A source sheet can contain only internally managed rows. Do not let
-        # that filtered preview erase a previously stored legacy source.
-        return {"removed": 0, "added": 0, "ignored_internal": ignored_internal}
+        result = {"removed": 0, "added": 0, "ignored_internal": ignored_internal}
+        if max_legacy_version is not None:
+            result.update(updated=0, ignored_out_of_scope=ignored_out_of_scope)
+        return result
+    fields = ("track", "log_date", "member_id", "version", "subsystem", "category", "req_done", "tc_done",
+              "func_done", "issue_done", "new_req_done", "modified_req_done", "deleted_req_done", "defect_done",
+              "tc_created_done", "tc_modified_done", "tc_deleted_done", "notes")
+    def values(e):
+        return (e["track"], _iso(e["date"]), e["member_id"], e.get("version", ""), e.get("subsystem", ""),
+                e.get("category", ""), e.get("req", 0), e.get("tc", 0), e.get("func", 0), e.get("issue", 0),
+                e.get("new_req"), e.get("modified_req"), e.get("deleted_req"), e.get("defect"),
+                e.get("tc_created"), e.get("tc_modified"), e.get("tc_deleted"), e.get("notes", ""))
     with connect(path) as c:
-        removed = c.execute("SELECT COUNT(*) FROM work_logs WHERE source=?", (source,)).fetchone()[0]
-        c.execute("DELETE FROM work_logs WHERE source=?", (source,))
-        c.executemany("""INSERT INTO work_logs(source,track,log_date,member_id,version,subsystem,category,
-                      req_done,tc_done,func_done,issue_done,new_req_done,modified_req_done,deleted_req_done,
-                      defect_done,tc_created_done,tc_modified_done,tc_deleted_done,notes,src_row)
-                      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                      [(source, e["track"], _iso(e["date"]), e["member_id"], e.get("version", ""), e.get("subsystem", ""), e.get("category", ""),
-                        e.get("req", 0), e.get("tc", 0), e.get("func", 0), e.get("issue", 0), e.get("new_req"),
-                        e.get("modified_req"), e.get("deleted_req"), e.get("defect"), e.get("tc_created"),
-                        e.get("tc_modified"), e.get("tc_deleted"), e.get("notes", ""), e.get("row")) for e in retained])
-    return {"removed": removed, "added": len(retained), "ignored_internal": ignored_internal}
+        existing = c.execute("SELECT id,src_row," + ",".join(fields) + " FROM work_logs WHERE source=? ORDER BY id", (source,)).fetchall()
+        by_row = {row["src_row"]: row for row in existing if row["src_row"] is not None}
+        by_content = {}
+        for row in existing:
+            fp = tuple(row[field] for field in fields)
+            by_content.setdefault(fp, []).append(row)
+        used, processed_rows, added, updated = set(), set(), 0, 0
+        for entry in retained:
+            row_no = entry.get("row")
+            if row_no is not None and row_no in processed_rows:
+                continue
+            if row_no is not None:
+                processed_rows.add(row_no)
+            data = values(entry)
+            current = by_row.get(row_no) if row_no is not None else None
+            if current is None or current["id"] in used:
+                current = next((row for row in by_content.get(data, []) if row["id"] not in used), None)
+            if current is None:
+                c.execute("""INSERT INTO work_logs(source,track,log_date,member_id,version,subsystem,category,
+                             req_done,tc_done,func_done,issue_done,new_req_done,modified_req_done,deleted_req_done,
+                             defect_done,tc_created_done,tc_modified_done,tc_deleted_done,notes,src_row)
+                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (source, *data, row_no))
+                added += 1
+            else:
+                used.add(current["id"])
+                c.execute("""UPDATE work_logs SET track=?,log_date=?,member_id=?,version=?,subsystem=?,category=?,
+                             req_done=?,tc_done=?,func_done=?,issue_done=?,new_req_done=?,modified_req_done=?,deleted_req_done=?,
+                             defect_done=?,tc_created_done=?,tc_modified_done=?,tc_deleted_done=?,notes=?,src_row=? WHERE id=?""",
+                          (*data, row_no if row_no is not None else current["src_row"], current["id"]))
+                updated += 1
+    result = {"removed": 0, "added": added, "ignored_internal": ignored_internal}
+    if max_legacy_version is not None:
+        result.update(updated=updated, ignored_out_of_scope=ignored_out_of_scope)
+    return result
 
 
 def delete_logs(source: str | None = None, path=None) -> int:
@@ -912,6 +1027,9 @@ def save_version_worklog(project_id: int, phase: str, fields: dict, log_id: int 
         raise ValueError("업무 유형은 spec 또는 verify여야 합니다.")
     table = _INTERNAL_LOG_TABLES[phase]
     metrics = INTERNAL_LOG_FIELDS[phase]
+    task_detail = str(fields.get("task_detail") or ACTUAL_TASK_DETAILS[phase][0]).strip()
+    if task_detail not in ACTUAL_TASK_DETAILS[phase]:
+        raise ValueError("업무 세부 유형을 선택하세요.")
     try:
         log_date = _iso(fields.get("date"))
         member_id = int(fields.get("member_id"))
@@ -957,16 +1075,16 @@ def save_version_worklog(project_id: int, phase: str, fields: dict, log_id: int 
             old = c.execute(f"SELECT id FROM {table} WHERE id=? AND project_id=?", (int(log_id), int(project_id))).fetchone()
             if not old:
                 raise ValueError("수정할 업무 기록이 없습니다.")
-            assignments = ["subsystem_id=?", "log_date=?", "member_id=?", *[f"{key}=?" for key in metrics],
+            assignments = ["subsystem_id=?", "log_date=?", "member_id=?", "task_detail=?", *[f"{key}=?" for key in metrics],
                            "notes=?", "updated_at=strftime('%Y-%m-%d %H:%M:%f','now')"]
             c.execute(f"UPDATE {table} SET {','.join(assignments)} WHERE id=? AND project_id=?",
-                      (subsystem_id, log_date, member_id, *values, str(fields.get("notes") or "").strip(), int(log_id), int(project_id)))
+                      (subsystem_id, log_date, member_id, task_detail, *values, str(fields.get("notes") or "").strip(), int(log_id), int(project_id)))
             (_invalidate_spec_review if phase == "spec" else _invalidate_verify_review)(c, project_id)
             return int(log_id)
-        cols = ["project_id", "subsystem_id", "log_date", "member_id", *metrics, "notes"]
+        cols = ["project_id", "subsystem_id", "log_date", "member_id", "task_detail", *metrics, "notes"]
         placeholders = ",".join("?" for _ in cols)
         cur = c.execute(f"INSERT INTO {table}({','.join(cols)}) VALUES ({placeholders})",
-                        (int(project_id), subsystem_id, log_date, member_id, *values, str(fields.get("notes") or "").strip()))
+                        (int(project_id), subsystem_id, log_date, member_id, task_detail, *values, str(fields.get("notes") or "").strip()))
         (_invalidate_spec_review if phase == "spec" else _invalidate_verify_review)(c, project_id)
         return int(cur.lastrowid)
 

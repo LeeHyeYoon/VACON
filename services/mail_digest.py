@@ -232,8 +232,8 @@ def summarize_mails(mails: list[dict], start: date, end: date, team: TeamData | 
 def digest_markdown(res: dict, who: str = "", today: date | None = None) -> str:
     s, e = res["period"]
     st = res["stats"]
-    L = [f"# 대상 기간 메일 요약{' — ' + who if who else ''}", "",
-         f"- 대상 기간: {s} ~ {e}", f"- 기간 내 메일: {st['total']}건 (우선순위 높음 {st['높음']} · 보통 {st['보통']} · 낮음 {st['낮음']})",
+    L = [f"# 휴가 기간 메일 요약{' — ' + who if who else ''}", "",
+         f"- 휴가 기간: {s} ~ {e}", f"- 기간 내 메일: {st['total']}건 (우선순위 높음 {st['높음']} · 보통 {st['보통']} · 낮음 {st['낮음']})",
          f"- 회신/확인이 필요해 보이는 메일: {st['need_reply']}건", f"- 복귀 시점에 기한이 지난 항목이 있는 메일: {st['past_deadline']}건"]
     if res["outside_count"]:
         L.append(f"- 기간 밖이라 제외한 메일: {res['outside_count']}건")

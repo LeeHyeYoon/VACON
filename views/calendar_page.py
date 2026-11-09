@@ -20,7 +20,8 @@ def render(team, rules):
 
 def _view(team, rules):
     c1, c2 = st.columns([1, 2])
-    mode = c1.radio("보기", ["주간", "월간"], horizontal=True)
+    mode = c1.segmented_control("보기", ["주간", "월간"], selection_mode="single",
+                                default="주간", width="stretch") or "주간"
     anchor = c2.date_input("기준 날짜", value=today())
     s, e = cal.week_range(anchor) if mode == "주간" else cal.month_range(anchor)
     st.caption(f"{s} ~ {e} (주말 제외)")
@@ -103,6 +104,6 @@ def _edit(team):
                 db.update_leave(lid, member, start, end, ltype, note)
                 st.success("수정했습니다.")
                 st.rerun()
-    if st.button("🗑️ 이 휴가 삭제", key=f"del_leave_{lid}"):
+    if st.button("휴가 삭제", type="tertiary", key=f"del_leave_{lid}"):
         db.delete_leave(lid)
         st.rerun()

@@ -18,6 +18,25 @@ from .sheet_sync import SheetError, match_owner, parse_sheet_date_ex
 
 TRACKS = {"dynamic": "동적 검증", "req": "요구사양서 작성"}
 LOG_ROLES = {"log_dynamic": "dynamic", "log_req": "req"}
+
+_SHEET_TASK_LABELS = {
+    "사양서작성": ("req", "사양서 작성"), "요구사양서작성": ("req", "사양서 작성"),
+    "일감정리": ("req", "일감 정리"), "업무구분": ("req", "업무 구분"),
+    "동적검증": ("dynamic", "동적 검증"), "tc실행": ("dynamic", "동적 검증"),
+    "regression검증": ("dynamic", "동적 검증"), "검증데이터세팅": ("dynamic", "검증데이터 세팅"),
+    "결과보고서세팅": ("dynamic", "결과보고서 세팅"), "결과보고서작성": ("dynamic", "결과보고서 세팅"),
+    "결과분석": ("dynamic", "동적 검증"),
+}
+
+
+def classify_sheet_task(category, fallback_track: str) -> tuple[str, str]:
+    """Classify work from its D-column label; the tab resolves only ambiguous labels."""
+    raw = str(category or "").strip()
+    key = re.sub(r"\s+", "", raw).casefold()
+    if key == "산출물검토":
+        return fallback_track, "산출물 검토"
+    return _SHEET_TASK_LABELS.get(key, (fallback_track, raw))
+
 METRIC_COLS = {"dynamic": ("tc", "req", "func"), "req": ("issue",)}
 METRIC_LABELS = {"tc": "실행 TC", "req": "완료 요구사양서", "func": "완료 함수", "issue": "완료 일감",
                  "new_req": "신규 요구사양", "modified_req": "수정 요구사양", "deleted_req": "삭제 요구사양",
@@ -166,7 +185,7 @@ def parse_logs(text: str, cfg: dict, team: TeamData, today: date | None = None) 
     fill, year = bool(cfg.get("fill_down")), cfg.get("year") or None
     entries, warnings, unmatched = [], [], set()
     bad_dates: Counter = Counter()
-    text_cells = skipped = blank_date_rows = inferred = 0
+    text_cells = skipped = blank_date_rows = unassigned_rows = inferred = 0
     last_date = last_member = None
     if moved:
         warnings.append("저장된 헤더 이름을 기준으로 이동한 열을 다시 연결했습니다: " + "; ".join(moved))
@@ -180,6 +199,8 @@ def parse_logs(text: str, cfg: dict, team: TeamData, today: date | None = None) 
         if not raw_d and not (fill and last_date and raw_m):
             if raw_m:
                 blank_date_rows += 1
+            else:
+                unassigned_rows += 1
             skipped += 1
             continue
         if raw_d:
@@ -215,7 +236,8 @@ def parse_logs(text: str, cfg: dict, team: TeamData, today: date | None = None) 
                     warnings.append(f"{n}행: {METRIC_LABELS[m]} 값 '{get(m)}'이(가) 음수라 0으로 처리")
         entries.append(e)
     diag = {"bad_dates": bad_dates.most_common(10), "bad_date_rows": sum(bad_dates.values()),
-            "blank_date_rows": blank_date_rows, "inferred_year": inferred, "header_guess": guess,
+            "blank_date_rows": blank_date_rows, "unassigned_rows": unassigned_rows,
+            "inferred_year": inferred, "header_guess": guess,
             "header_hint": hint.strip(), "date_col": cols["date"]}
     if diag["bad_date_rows"]:
         ex = ", ".join(f"'{v}'×{c}" for v, c in diag["bad_dates"][:5])

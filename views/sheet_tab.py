@@ -2,8 +2,10 @@
 역할: 업무 목록 / 일정(마감일) / 작업 로그(동적 검증·요구사양서 작성, 열 문자 기반)."""
 import pandas as pd
 import streamlit as st
+from io import BytesIO
 
 from data import db
+from services import google_sheets
 from services import sheet_sync as ss
 from services import worklog as wl
 from services.models import required_skills
@@ -45,19 +47,168 @@ def _preview_df(text, n=12):
     return df
 
 
+def _uploaded_workbook(upload):
+    """Excel 파일의 모든 탭을 헤더 추정 없이 원본 행으로 읽는다."""
+    try:
+        book = pd.ExcelFile(BytesIO(upload.getvalue()), engine="openpyxl")
+        sheets = []
+        for name in book.sheet_names:
+            frame = pd.read_excel(book, sheet_name=name, header=None, dtype=str, keep_default_na=False)
+            sheets.append({"label": f"파일:{upload.name}:탭:{name}", "title": name,
+                           "rows": frame.astype(str).values.tolist()})
+        return sheets
+    except ImportError:
+        raise ss.SheetError("Excel 파일 분석에 openpyxl이 필요합니다. requirements.txt 설치 후 다시 실행하세요.") from None
+    except Exception as exc:
+        raise ss.SheetError(f"Excel 파일을 읽지 못했습니다: {exc}") from None
+
+
+def _show_auto_log_plan(team, plan):
+    st.subheader("ALIRA 분석 결과 미리보기")
+    if plan["sheets"]:
+        show_df(pd.DataFrame([{"시트": item["label"],
+                               "판별": {"req": "요구사양서 작성", "dynamic": "동적 검증", "other": "업무 로그 아님"}.get(item["track"], item["track"]),
+                               "반영 대상 행": item.get("accepted_records", 0),
+                               "신뢰도": f"{item['confidence']:.0%}", "분석 근거": item["reason"]}
+                              for item in plan["sheets"]]))
+    if plan["problems"]:
+        st.error("확인이 필요한 탭이 있어 저장을 보류했습니다: " + " · ".join(plan["problems"]))
+    if not plan["entries"]:
+        st.info("업무 로그로 분류된 행이 없습니다.")
+        return
+    rows = []
+    labels = {"req": "요구사양서 작성", "dynamic": "동적 검증"}
+    for entry in plan["entries"]:
+        rows.append({"업무 유형": labels[entry["track"]], "시트": entry["source"], "날짜": entry["date"],
+                     "담당자": team.name(entry["member_id"]), "버전": entry.get("version"),
+                     "서브시스템": entry.get("subsystem"), "완료 일감": entry.get("issue"),
+                     "완료 요구사양서": entry.get("req"), "완료 함수": entry.get("func"),
+                     "결함": entry.get("defect"), "실행 TC": entry.get("tc"),
+                     "신규 Req": entry.get("new_req"), "수정 Req": entry.get("modified_req"),
+                     "삭제 Req": entry.get("deleted_req"), "생성 TC": entry.get("tc_created"),
+                     "수정 TC": entry.get("tc_modified"), "삭제 TC": entry.get("tc_deleted")})
+    frame = pd.DataFrame(rows)
+    for track, title in (("req", "요구사양서 작성 실적"), ("dynamic", "동적 검증 실적")):
+        subset = frame[frame["업무 유형"] == labels[track]]
+        if not subset.empty:
+            st.write(f"**{title} · {len(subset)}건**")
+            show_df(subset)
+    if plan["unmatched_members"]:
+        st.warning("VACON 팀원과 일치하지 않아 반영할 수 없는 담당자: " + ", ".join(plan["unmatched_members"]))
+    if plan["warnings"]:
+        with st.expander(f"데이터 해석 안내 {len(plan['warnings'])}건"):
+            for warning in plan["warnings"][:150]:
+                st.write("- " + warning)
+    unresolved_rows = max(0, plan["skipped"] - plan.get("unassigned_rows", 0))
+    if plan.get("unassigned_rows"):
+        st.caption(f"날짜·담당자 없이 별도 계획 정보만 있는 행 {plan['unassigned_rows']}건은 업무 실적으로 보지 않아 제외했습니다.")
+    if unresolved_rows:
+        st.warning(f"날짜 또는 담당자를 해석할 수 없어 제외한 행: {unresolved_rows}건")
+    if plan.get("excluded_versions"):
+        st.caption(f"T0700 이후 또는 버전이 불명확해 제외된 기록: {plan['excluded_versions']}건")
+    if plan["ready"] and st.button("업무 로그 반영", key="auto_log_apply", type="primary"):
+        totals = {"added": 0, "updated": 0, "removed": 0}
+        grouped = {}
+        for entry in plan["entries"]:
+            grouped.setdefault(entry["source"], []).append(entry)
+        for source, entries in grouped.items():
+            result = db.replace_logs(source, entries, max_legacy_version=700)
+            for field in totals:
+                totals[field] += result[field]
+        st.session_state.pop("auto_log_plan", None)
+        st.success(f"신규 {totals['added']}건 추가 · 기존 {totals['updated']}건 갱신 · 삭제 {totals['removed']}건")
+        st.rerun()
+
+
 def render(team, rules):
     cfg = db.load_sync_config()
-    st.caption("구글 시트의 탭을 읽어 업무 로그·업무·마감일을 갱신합니다. 시트가 '링크가 있는 모든 사용자 - 뷰어'로 공유되어 있어야 직접 연결됩니다. "
-               "연결이 막히면 탭을 CSV로 내려받아 업로드해도 같은 방식으로 처리됩니다.")
-    url = st.text_input("구글 시트 주소", value=cfg["sheet"], placeholder="https://docs.google.com/spreadsheets/d/…")
-    if st.button("주소 저장"):
-        try:
-            ss.extract_sheet_id(url)
-            db.save_sync_config({**cfg, "sheet": url})
-            st.success("저장했습니다.")
+    with st.expander("비공개 Google Sheets 연결", expanded=not google_sheets.is_connected()):
+        if google_sheets.is_connected():
+            st.success("이 PC의 Windows 계정에 Google Sheets 읽기 권한이 연결되어 있습니다.")
+        elif not google_sheets.has_client():
+            st.caption("최초 1회 Google OAuth Desktop client JSON이 필요합니다. 사내 Google Cloud에서 Sheets API가 활성화된 클라이언트 파일을 등록하세요.")
+        oauth_client = st.file_uploader("Google OAuth Desktop client JSON (최초 1회)", type=["json"], key="google_oauth_client_file")
+        if st.button("Google 계정 연결 / 권한 승인", key="google_sheets_connect"):
+            try:
+                google_sheets.authorize(oauth_client.getvalue() if oauth_client else None)
+                st.success("Google Sheets 읽기 권한이 연결됐습니다.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+        if google_sheets.is_connected() and st.button("Google 계정 연결 해제", key="google_sheets_disconnect"):
+            google_sheets.disconnect()
             st.rerun()
-        except ss.SheetError as e:
-            st.error(str(e))
+    header_url = st.text_input("Google Sheets 링크 (선택)", value=cfg["sheet"], placeholder="시트 주소만 붙여넣으세요")
+    upload = st.file_uploader("또는 두 탭이 포함된 Excel 파일 업로드", type=["xlsx"], key="auto_sheet_file")
+    st.caption("`2. Dynamic_Verification`과 `3. Req_Creation_WBS`만 분석하며 T0700까지 반영합니다.")
+    if st.button("ALIRA 분석 및 업무 로그 미리보기", key="auto_analyze_all", type="primary"):
+        try:
+            if upload is not None:
+                sheets = _uploaded_workbook(upload)
+            else:
+                if not header_url.strip():
+                    raise ss.SheetError("시트 링크를 붙여넣거나 Excel 파일을 업로드하세요.")
+                sheet_id = ss.extract_sheet_id(header_url)
+                try:
+                    same_saved_sheet = ss.extract_sheet_id(cfg.get("sheet", "")) == sheet_id
+                except ss.SheetError:
+                    same_saved_sheet = False
+                wanted = (("dynamic", "2. Dynamic_Verification", "log_dynamic"),
+                          ("req", "3. Req_Creation_WBS", "log_req"))
+                if google_sheets.is_connected():
+                    try:
+                        all_tabs = google_sheets.list_spreadsheet_tabs(header_url)
+                    except RuntimeError as exc:
+                        raise ss.SheetError(str(exc)) from None
+                    by_title = {" ".join(tab["title"].split()).casefold(): tab for tab in all_tabs}
+                    tabs = []
+                    for track, title, role in wanted:
+                        tab = by_title.get(" ".join(title.split()).casefold())
+                        if tab:
+                            tabs.append({**tab, "title": title, "expected_track": track})
+                else:
+                    try:
+                        public_tabs = ss.discover_sheet_tabs(header_url)
+                    except ss.SheetError:
+                        raise ss.SheetError("이 시트는 Google 로그인이 필요합니다. 위의 '비공개 Google Sheets 연결'에서 사내 계정을 연결하세요.") from None
+                    saved_by_role = {source.get("role"): source for source in cfg.get("sources", [])
+                                     if str(source.get("gid", "")).isdigit()}
+                    tabs = []
+                    for track, title, role in wanted:
+                        source = saved_by_role.get(role)
+                        if source and any(str(item["gid"]) == str(source["gid"]) for item in public_tabs):
+                            tabs.append({"gid": str(source["gid"]), "title": title,
+                                         "expected_track": track, "saved_label": source.get("label")})
+                if len(tabs) != len(wanted):
+                    raise ss.SheetError("두 필수 탭을 모두 찾지 못했습니다. 시트 이름과 Google 계정 접근 권한을 확인하세요.")
+                sheets = []
+                for tab in tabs:
+                    track, title = tab["expected_track"], tab["title"]
+                    role = "log_dynamic" if track == "dynamic" else "log_req"
+                    previous = next((source for source in cfg.get("sources", [])
+                                     if same_saved_sheet and str(source.get("gid", "")) == str(tab["gid"])
+                                     and source.get("role") == role), None)
+                    stable_label = tab.get("saved_label") or (previous.get("label") if previous else f"Google:{sheet_id}:gid{tab['gid']}")
+                    if google_sheets.is_connected():
+                        rows = google_sheets.read_tab(header_url, tab)
+                    else:
+                        rows = _rows(ss.fetch_csv(header_url, tab["gid"]))
+                    sheets.append({"label": stable_label, "title": title, "expected_track": track, "rows": rows})
+            plan = ss.analyze_worklog_sheets(sheets, team)
+            st.session_state["auto_log_plan"] = plan
+            if header_url.strip():
+                db.save_sync_config({**cfg, "sheet": header_url.strip()})
+        except (ss.SheetError, RuntimeError) as exc:
+            st.error(str(exc))
+    auto_plan = st.session_state.get("auto_log_plan")
+    if auto_plan:
+        _show_auto_log_plan(team, auto_plan)
+
+    st.divider()
+    if not st.toggle("기존 수동 시트 설정 열기 (업무 목록·일정 등)", value=False, key="show_legacy_sheet_settings"):
+        return
+    st.caption("고급 설정: 기존 탭별 열 매핑과 업무 목록·일정 동기화 기능입니다.")
+    url = st.text_input("기존 수동 연동용 Google Sheets 주소", value=cfg["sheet"], placeholder="https://docs.google.com/spreadsheets/d/…")
 
     st.subheader("① 연동할 탭 설정")
     labels = [s["label"] for s in cfg["sources"]]
@@ -70,7 +221,7 @@ def render(team, rules):
     roles = list(ROLE_LABEL)
     role = c[2].selectbox("역할", roles, index=roles.index(cur.get("role", "log_dynamic")), format_func=ROLE_LABEL.get, key=f"role_{k}")
     st.caption("헤더 행은 파일에서 열 이름을 찾기 위해 쓰는 설정입니다. 보통 첫 행에 열 이름이 있으므로 자동으로 읽습니다. 위에 설명이나 빈 줄이 있을 때만 조정하세요.")
-    manual_header = st.checkbox("파일 앞부분에 설명/빈 줄이 있어 헤더 행을 직접 지정", value=False,
+    manual_header = st.toggle("파일 앞부분에 설명/빈 줄이 있어 헤더 행을 직접 지정", value=False,
                                 key=f"manual_hr_{k}", help="예: 1행은 제목 설명, 2행에 업무명·담당자 같은 열 이름이 있으면 2를 선택합니다.")
     header_row = (st.number_input("열 이름이 있는 행 번호 (첫 행부터 1)", 1, 50,
                                   int(cur.get("header_row", 1)), key=f"hr_{k}")
@@ -165,7 +316,7 @@ def render(team, rules):
         if "subsystem" not in cols:
             st.caption("서브시스템 열은 선택 항목입니다. 매핑하지 않으면 가져온 로그는 ‘서브시스템 미입력’으로 표시됩니다.")
         o = st.columns(2)
-        fill = o[0].checkbox("병합 셀 대응: 빈 날짜·담당자는 위 행 값 사용", value=bool(cur.get("fill_down")), key=f"fill_{k}",
+        fill = o[0].toggle("병합 셀 대응: 빈 날짜·담당자는 위 행 값 사용", value=bool(cur.get("fill_down")), key=f"fill_{k}",
                              help="날짜나 담당자 칸이 병합되어 첫 행에만 값이 있는 시트에서 켜세요.")
         yr = o[1].number_input("연도(날짜에 연도가 없을 때만 사용, 0=자동 추정)", 0, 2100, int(cur.get("year") or 0), key=f"yr_{k}")
         if st.button("이 탭 설정 저장", key=f"save_{k}"):
@@ -265,7 +416,7 @@ def _show_log_plan(team, sp, src_label):
     cur = int((team.logs["source"] == src_label).sum()) if len(team.logs) else 0
     m = st.columns(4)
     m[0].metric("읽은 기록", f"{len(ents)}건")
-    m[1].metric("현재 저장된 기록", f"{cur}건", help="반영하면 이 탭의 기존 기록은 시트 내용으로 교체됩니다.")
+    m[1].metric("현재 저장된 기록", f"{cur}건", help="반영 시 같은 시트 행은 갱신하고 새 행은 추가합니다. 원본에서 빠진 저장 기록도 삭제하지 않습니다.")
     m[2].metric("건너뛴 행", res["skipped"])
     m[3].metric("기간", f"{res['date_range'][0]} ~ {res['date_range'][1]}" if res["date_range"] else "-")
     if ents:
@@ -291,15 +442,15 @@ def _show_log_plan(team, sp, src_label):
             for w in res["warnings"][:200]:
                 st.write("- " + w)
     has_sample = len(team.logs) and (team.logs["source"] == "샘플").any()
-    drop_sample = st.checkbox("샘플(가상) 로그 삭제", value=True, key="drop_sample") if has_sample and src_label != "샘플" else False
-    if ents and st.button("✅ 미리보기 내용 반영(이 탭의 기존 기록 교체)", key="log_apply"):
+    drop_sample = st.toggle("샘플(가상) 로그 삭제", value=True, key="drop_sample") if has_sample and src_label != "샘플" else False
+    if ents and st.button("미리보기 반영", key="log_apply", type="primary"):
         try:
             r = db.replace_logs(src_label, ents)
             if drop_sample:
                 db.delete_logs("샘플")
             st.session_state.pop("sync_plan", None)
             suffix = f" · 내부 DB 관리 버전 {r['ignored_internal']}건은 시트에서 제외했습니다." if r.get("ignored_internal") else ""
-            st.success(f"기존 {r['removed']}건을 {r['added']}건으로 교체했습니다.{suffix}")
+            st.success(f"새 기록 {r['added']}건 추가 · 기존 기록 {r.get('updated', 0)}건 갱신 · 삭제 {r['removed']}건{suffix}")
             st.rerun()
         except ValueError as exc:
             st.error(str(exc))
@@ -332,7 +483,7 @@ def _show_task_plan(team, p, src_label):
             for w in p["warnings"]:
                 st.write("- " + w)
     if p["add"] or p["update"]:
-        if st.button("✅ 미리보기 내용 반영", key="sync_apply"):
+        if st.button("미리보기 반영", key="sync_apply", type="primary"):
             r = db.apply_sync_plan(p, src_label)
             st.session_state.pop("sync_plan", None)
             st.success(f"추가 {r['added']}건, 변경 {r['updated']}건을 반영했습니다.")

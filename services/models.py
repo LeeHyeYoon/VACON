@@ -14,7 +14,7 @@ STATUSES = ["대기", "진행중", "지연", "완료"]
 SKILL_LEVELS = {1: "기초", 2: "중급", 3: "전문"}
 
 MBTI_TYPES = [a + b + c + d for a in "EI" for b in "NS" for c in "TF" for d in "JP"]
-MEMBER_COLS = ["id", "name", "role", "workload", "contact", "mbti"]
+MEMBER_COLS = ["id", "name", "role", "workload", "contact", "mbti", "certifications"]
 SKILL_COLS = ["member_id", "skill", "level"]
 TASK_COLS = ["id", "name", "owner_id", "backup_id", "importance", "status", "progress",
              "due_date", "required_skill", "remaining", "notes", "load_pct", "source"]

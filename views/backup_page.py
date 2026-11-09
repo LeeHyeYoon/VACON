@@ -15,14 +15,23 @@ def _render_version_leave_coverage(team):
         return
     selected = st.selectbox("대체 대상 업무 선택", targets, format_func=lambda row: row["label"],
                             key="scheduled_coverage_target")
-    st.write(f"**휴가자 및 기간:** {selected['member_name']} · {selected['leave_start']}~{selected['leave_end']} ({selected['leave_type']})")
-    st.write(f"**대상 버전 및 업무:** {selected['version']} · {selected['phase_label']} · 실제 겹치는 기간 {selected['overlap_start']}~{selected['overlap_end']}")
+    with st.container(border=True):
+        st.markdown("**선택한 대체 대상**")
+        info = st.columns(3)
+        info[0].caption("휴가자")
+        info[0].markdown(f"**{selected['member_name']}** · {selected['leave_type']}")
+        info[1].caption("휴가 기간")
+        info[1].markdown(f"**{selected['leave_start']} ~ {selected['leave_end']}**")
+        info[2].caption("대상 업무")
+        info[2].markdown(f"**{selected['version']} · {selected['phase_label']}**")
+        st.caption(f"실제 일정과 겹치는 기간　{selected['overlap_start']} ~ {selected['overlap_end']}")
     if selected["status"] != "대상 업무":
         st.warning(selected["reason"])
         return
     project = db.get_version_project(selected["project_id"])
     result = recommend_version_leave_coverage(team, project, selected["member_id"],
         selected["overlap_start"], selected["overlap_end"])
+    st.divider()
     st.subheader("AI 추천 대체 업무")
     phase = result.get("phase", selected["phase"])
     team_daily = result.get("team_daily_required", {})
@@ -92,9 +101,9 @@ def _render_version_leave_coverage(team):
                 st.warning(warning)
         project_assignments = result.get("project_assignments", [])
         if result.get("saveable") and project_assignments:
-            approved = st.checkbox("버전 잔여 업무 재분배안을 확인했고 PM 배정으로 승인합니다.",
+            approved = st.toggle("버전 잔여 업무 재분배안을 확인했고 PM 배정으로 승인합니다.",
                                    key=f"scheduled_plan_approved_{selected['id']}")
-            if st.button("PM 승인 재분배안 저장", disabled=not approved, key=f"scheduled_plan_save_{selected['id']}"):
+            if st.button("승인 재분배안 저장", type="primary", disabled=not approved, key=f"scheduled_plan_save_{selected['id']}"):
                 try:
                     count = db.replace_version_assignments(selected["project_id"], selected["phase"], project_assignments)
                     st.cache_data.clear()
@@ -107,8 +116,8 @@ def _render_version_leave_coverage(team):
     else:
         assigned_rows = result.get("assignments", [])
         if assigned_rows:
-            approved = st.checkbox("추천 분배안을 확인했고 PM 대체 배정으로 승인합니다.", key=f"scheduled_coverage_approved_{selected['id']}")
-            if st.button("PM 승인 대체 배정 저장", disabled=not approved, key=f"scheduled_coverage_save_{selected['id']}"):
+            approved = st.toggle("추천 분배안을 확인했고 PM 대체 배정으로 승인합니다.", key=f"scheduled_coverage_approved_{selected['id']}")
+            if st.button("승인 대체 배정 저장", type="primary", disabled=not approved, key=f"scheduled_coverage_save_{selected['id']}"):
                 try:
                     count = db.save_version_backup_assignments(selected["project_id"], selected["phase"],
                         selected["member_id"], selected["leave_start"], selected["leave_end"], assigned_rows)
