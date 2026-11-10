@@ -92,11 +92,13 @@ def _member(team, name):
 
 
 def _matches(value, requested):
-    return not requested or str(value or "").strip().casefold() == str(requested).strip().casefold()
+    return not requested or str("" if isnull(value) else value).strip().casefold() == str(requested).strip().casefold()
 
 
 def _date_text(value):
-    return value.isoformat() if hasattr(value, "isoformat") else str(value or "")
+    if isnull(value):
+        return ""
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
 
 
 def _search_worklogs(args, team):
@@ -168,6 +170,7 @@ def _search_worklogs(args, team):
 
     filtered = []
     for entry in entries:
+        entry = {key: (None if isnull(value) else value) for key, value in entry.items()}
         if kind != "전체" and entry["record_kind"] != kind:
             continue
         if not _matches(entry.get("version"), args.get("version")):
