@@ -10,6 +10,7 @@ from .recommend import recommend_backups
 from .risk import HIGH, MEDIUM, assess_tasks, daily_summary
 from .version_projects import aggregate_version_logs, project_summary
 from .internal_projects import dashboard as internal_dashboard, is_internal_version
+from .worklog import classify_sheet_task
 
 
 TOOL_DEFINITIONS = [
@@ -22,6 +23,16 @@ TOOL_DEFINITIONS = [
      "input_schema": {"type": "object", "properties": {"version": {"type": "string", "description": "등록된 버전명"}}, "required": ["version"]}},
     {"name": "get_daily_workload", "description": "버전의 사양서 작성량과 동적검증량을 담당자 휴가와 주말에 따라 계산한다.",
      "input_schema": {"type": "object", "properties": {"version": {"type": "string", "description": "등록된 버전명"}}, "required": ["version"]}},
+    {"name": "search_worklogs", "description": "검증 업무 로그를 직접 조회한다. 과거 Google Sheets 실적(T0800 미만), VACON 내부 DB 실적(T0800 이상), PM 예정 일정을 구분해서 반환한다. 사용자가 업무 로그, 실제 실적, 담당자별 수행 내역, 세부 업무, 서브시스템 이력을 물으면 반드시 이 도구를 먼저 호출한다. 가능한 필터만 전달하고 날짜가 없으면 전체 기간을 조회한다.",
+     "input_schema": {"type": "object", "properties": {
+         "version": {"type": "string", "description": "버전명(선택)"},
+         "member_name": {"type": "string", "description": "담당자 이름(선택)"},
+         "subsystem": {"type": "string", "description": "서브시스템명(선택)"},
+         "work_type": {"type": "string", "description": "요구사양서 작성 또는 동적 검증(선택)"},
+         "start_date": {"type": "string", "description": "조회 시작일 YYYY-MM-DD(선택)"},
+         "end_date": {"type": "string", "description": "조회 종료일 YYYY-MM-DD(선택)"},
+         "record_kind": {"type": "string", "enum": ["전체", "실적", "예정 일정"], "description": "기록 종류(선택, 기본 전체)"},
+         "limit": {"type": "integer", "description": "반환할 최대 행 수(기본 30, 최대 100)"}}, "required": []}},
     {"name": "analyze_work_risks", "description": "지정 기간의 등록 업무 위험을 기존 위험 분석 로직으로 평가한다. 특정 버전이 있으면 해당 버전의 일정 위험도 포함한다.",
      "input_schema": {"type": "object", "properties": {
          "start_date": {"type": "string", "description": "분석 시작일 YYYY-MM-DD"},
@@ -49,6 +60,7 @@ _ARGUMENT_KEYS = {
     "list_vacations": {"start_date", "end_date", "member_name"},
     "get_version_status": {"version"},
     "get_daily_workload": {"version"},
+    "search_worklogs": {"version", "member_name", "subsystem", "work_type", "start_date", "end_date", "record_kind", "limit"},
     "analyze_work_risks": {"start_date", "end_date", "version"},
     "recommend_backup": {"task_name", "start_date", "end_date"},
     "draft_handover": {"member_name", "start_date", "end_date"},
@@ -77,6 +89,110 @@ def _member(team, name):
             raise ValueError(f"팀원 '{name}'을(를) 찾지 못했습니다.")
         raise ValueError("팀원 이름이 중복되어 대상을 특정할 수 없습니다.")
     return hits[0]
+
+
+def _matches(value, requested):
+    return not requested or str(value or "").strip().casefold() == str(requested).strip().casefold()
+
+
+def _date_text(value):
+    return value.isoformat() if hasattr(value, "isoformat") else str(value or "")
+
+
+def _search_worklogs(args, team):
+    start = end = None
+    if args.get("start_date") or args.get("end_date"):
+        if not args.get("start_date") or not args.get("end_date"):
+            raise ValueError("기간 조회에는 시작일과 종료일을 모두 입력하세요.")
+        start, end = _period(args)
+    limit = max(1, min(100, int(args.get("limit", 30))))
+    requested_type = str(args.get("work_type") or "").strip().casefold()
+    type_aliases = {"요구사양서": "req", "요구사양서 작성": "req", "작성": "req", "req": "req",
+                    "동적 검증": "dynamic", "동적검증": "dynamic", "검증": "dynamic", "dynamic": "dynamic"}
+    track_filter = type_aliases.get(requested_type)
+    if requested_type and not track_filter:
+        raise ValueError("업무 유형은 요구사양서 작성 또는 동적 검증으로 지정하세요.")
+    kind = str(args.get("record_kind") or "전체").strip()
+    if kind not in {"전체", "실적", "예정 일정"}:
+        raise ValueError("기록 종류는 전체, 실적, 예정 일정 중 하나여야 합니다.")
+    entries = []
+
+    # 과거 버전의 원본 실적은 Google Sheets 연동이 적재한 팀 로그에서 읽는다.
+    for row in team.logs.to_dict("records") if len(team.logs) else []:
+        if str(row.get("source") or "") == "샘플":
+            continue
+        track, detail = classify_sheet_task(row.get("category"), "req" if row.get("track") == "req" else "verify")
+        work_type = "요구사양서 작성" if track == "req" else "동적 검증"
+        entry = {"date": _date_text(row.get("date")), "version": str(row.get("version") or "").strip() or "(버전 미입력)",
+                 "member": team.name(row.get("member_id")), "subsystem": str(row.get("subsystem") or "").strip() or "공통 업무",
+                 "work_type": work_type, "detail": detail, "record_kind": "실적", "source": row.get("source") or "Google Sheets",
+                 "completed_tasks": row.get("issue") if track == "req" else None,
+                 "new_requirements": row.get("new_req") if track == "req" else None,
+                 "modified_requirements": row.get("modified_req") if track == "req" else None,
+                 "deleted_requirements": row.get("deleted_req") if track == "req" else None,
+                 "completed_requirements": row.get("req") if track == "dynamic" else None,
+                 "completed_functions": row.get("func") if track == "dynamic" else None,
+                 "defects": row.get("defect") if track == "dynamic" else None,
+                 "tc_executed": row.get("tc") if track == "dynamic" else None,
+                 "tc_created": row.get("tc_created") if track == "dynamic" else None,
+                 "tc_modified": row.get("tc_modified") if track == "dynamic" else None,
+                 "tc_deleted": row.get("tc_deleted") if track == "dynamic" else None,
+                 "notes": row.get("notes") or ""}
+        entries.append(entry)
+
+    # 신규 버전 실적은 내부 DB에서 업무 단계별로 읽는다.
+    internal_fields = {
+        "spec": ("completed_tasks", "new_requirements", "modified_requirements", "deleted_requirements"),
+        "verify": ("completed_requirements", "completed_functions", "defects", "tc_executed", "tc_created", "tc_modified", "tc_deleted"),
+    }
+    for phase in ("spec", "verify"):
+        for row in db.list_all_internal_worklogs(phase):
+            if not is_internal_version(row.get("version", "")):
+                continue
+            work_type = "요구사양서 작성" if phase == "spec" else "동적 검증"
+            entry = {"date": _date_text(row.get("date")), "version": row.get("version"), "member": row.get("member_name"),
+                     "subsystem": row.get("subsystem") or "공통 업무", "work_type": work_type,
+                     "detail": row.get("task_detail") or ("사양서 작성" if phase == "spec" else "동적 검증"),
+                     "record_kind": "실적", "source": "VACON DB", "notes": row.get("notes") or ""}
+            entry.update({field: row.get(field) for field in internal_fields[phase]})
+            entries.append(entry)
+
+    # PM 일정은 실적 집계와 혼합하지 않고 예정 일정으로 제공한다.
+    if kind != "실적":
+        for row in db.list_version_task_schedules():
+            track = "req" if row.get("phase") == "spec" else "dynamic"
+            work_type = "요구사양서 작성" if track == "req" else "동적 검증"
+            entries.append({"date": _date_text(row.get("work_date")), "version": row.get("version"),
+                            "member": row.get("member_name"), "subsystem": "공통 업무", "work_type": work_type,
+                            "detail": row.get("task_detail"), "record_kind": "예정 일정", "source": "PM 일정"})
+
+    filtered = []
+    for entry in entries:
+        if kind != "전체" and entry["record_kind"] != kind:
+            continue
+        if not _matches(entry.get("version"), args.get("version")):
+            continue
+        if not _matches(entry.get("member"), args.get("member_name")):
+            continue
+        if not _matches(entry.get("subsystem"), args.get("subsystem")):
+            continue
+        if track_filter and ("요구사양서 작성" if track_filter == "req" else "동적 검증") != entry["work_type"]:
+            continue
+        if start and end:
+            try:
+                entry_date = date.fromisoformat(entry["date"][:10])
+            except (TypeError, ValueError):
+                continue
+            if not start <= entry_date <= end:
+                continue
+        filtered.append(entry)
+    filtered.sort(key=lambda row: row.get("date") or "", reverse=True)
+    return {"filters": {"version": args.get("version"), "member": args.get("member_name"),
+                        "subsystem": args.get("subsystem"), "work_type": args.get("work_type"),
+                        "period": [start.isoformat(), end.isoformat()] if start else None, "record_kind": kind},
+            "matching_records": len(filtered), "returned_records": min(len(filtered), limit),
+            "truncated": len(filtered) > limit, "records": filtered[:limit],
+            "source_note": "과거 실적은 연동된 Google Sheets 로그, 신규 실적은 T0800 이상 VACON DB에서 조회했습니다. PM 일정은 예정 일정으로 따로 표시하며 실적 건수에 포함하지 않습니다."}
 
 
 def _project(version):
@@ -125,6 +241,8 @@ def execute_tool(name: str, args: dict, *, team, rules: dict, today: date):
     unknown = set(args) - _ARGUMENT_KEYS.get(name, set())
     if unknown:
         raise ValueError("지원하지 않는 도구 입력 항목: " + ", ".join(sorted(unknown)))
+    if name == "search_worklogs":
+        return _search_worklogs(args, team)
     if name == "list_vacations":
         start, end = _period(args)
         member = _member(team, args["member_name"]) if args.get("member_name") else None

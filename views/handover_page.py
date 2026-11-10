@@ -10,30 +10,35 @@ from views.common import fmt_leave, header
 
 def render(team, rules):
     header("📝 인수인계", "선택한 휴가의 담당 업무·대체 담당자 추천·위험 분석을 근거로 인수인계 문서를 자동 작성합니다.")
+    current_date = today()
     leaves = team.leave_records()
     if not leaves:
         st.info("등록된 휴가가 없습니다. '휴가 캘린더'에서 먼저 등록하세요.")
         return
-    leaves = sorted(leaves, key=lambda lv: (lv["end"] < today(), lv["start"]))
+    # 진행 중인 휴가는 계속 선택할 수 있고, 종료일이 오늘보다 이전인 휴가만 숨긴다.
+    leaves = sorted((lv for lv in leaves if lv["end"] >= current_date), key=lambda lv: lv["start"])
+    if not leaves:
+        st.info("오늘 이후 선택할 수 있는 휴가가 없습니다.")
+        return
     by_id = {lv["id"]: lv for lv in leaves}
     lid = st.selectbox("휴가 선택", list(by_id), format_func=lambda i: fmt_leave(team, by_id[i]))
     lv = by_id[lid]
-    template = generate_handover(team, lv["member_id"], lv["start"], lv["end"], lv["type"], today())
+    template = generate_handover(team, lv["member_id"], lv["start"], lv["end"], lv["type"], current_date)
     use_ai = llm.llm_available()
     if use_ai:
-        st.caption("AI 작성 — 생성 시 담당 업무·추천·위험 데이터가 사내 LLM 서버로 전송됩니다. "
+        st.caption("ALIRA 작성 — 생성 시 담당 업무·추천·위험 데이터가 ALIRA 서버로 전송됩니다. "
                    "추천 대체 담당자는 확정이 아니며, 사용 전 휴가자와 대체 담당자가 검토하세요.")
     else:
-        st.caption("LLM 미설정 — 템플릿으로 생성합니다. ALIRA_API_BASE와 ALIRA_MODEL을 설정하면 AI가 작성합니다. "
+        st.caption("ALIRA 미설정 — 템플릿으로 생성합니다. ALIRA_API_BASE와 ALIRA_MODEL을 설정하면 ALIRA가 작성합니다. "
                    "데이터가 없는 항목은 '미입력'으로 표시됩니다.")
     cache = st.session_state.setdefault("ho_ai_cache", {})
     key = (lid, template)  # 데이터가 바뀌면 템플릿이 달라져 다시 생성해야 한다
     label = "🔄 다시 생성" if key in cache else "📝 인수인계 문서 생성"
     if st.button(label, key=f"ho_gen_{lid}", type="secondary" if key in cache else "primary"):
         if use_ai:
-            with st.spinner("LLM이 인수인계 문서를 작성하는 중입니다... (30초~1분)"):
+            with st.spinner("ALIRA가 인수인계 문서를 작성하는 중입니다... (30초~1분)"):
                 cache[key] = generate_ai_handover(team, lv["member_id"], lv["start"], lv["end"], lv["type"],
-                                                  today(), rules)
+                                                  current_date, rules)
         else:
             cache[key] = (template, False)
         st.rerun()
@@ -42,7 +47,7 @@ def render(team, rules):
         return
     md, used = cache[key]
     if use_ai and not used:
-        st.warning("LLM 호출에 실패해 템플릿 문서를 표시합니다.")
+        st.warning("ALIRA 호출에 실패해 템플릿 문서를 표시합니다.")
     tab_prev, tab_src = st.tabs(["미리보기", "원문(Markdown)"])
     with tab_prev:
         st.markdown(md)
