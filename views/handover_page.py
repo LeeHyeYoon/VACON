@@ -9,7 +9,7 @@ from views.common import fmt_leave, header
 
 
 def render(team, rules):
-    header("📝 인수인계", "선택한 휴가의 담당 업무·대체 담당자 추천·위험 분석을 근거로 인수인계 문서를 자동 작성합니다.")
+    header("📝 인수인계", "현재 진행 버전의 본인 실적과 팀 진행 현황, 휴가 기간 예정 일정을 바탕으로 인계 문서를 작성합니다.")
     current_date = today()
     leaves = team.leave_records()
     if not leaves:
@@ -26,8 +26,12 @@ def render(team, rules):
     template = generate_handover(team, lv["member_id"], lv["start"], lv["end"], lv["type"], current_date)
     use_ai = llm.llm_available()
     if use_ai:
-        st.caption("ALIRA 작성 — 생성 시 담당 업무·추천·위험 데이터가 ALIRA 서버로 전송됩니다. "
-                   "추천 대체 담당자는 확정이 아니며, 사용 전 휴가자와 대체 담당자가 검토하세요.")
+        if lv["member_id"] in team.unit_pool():
+            st.caption("ALIRA 작성 — 선택한 휴가자의 현재 진행 버전 계획·배정·실적과 휴가 기간 일정을 ALIRA 서버로 전송합니다. "
+                       "개인 실적과 팀 전체 진행량, 예정 일정과 실제 실적을 구분해 검토하세요.")
+        else:
+            st.caption("ALIRA 작성 — 생성 시 담당 업무·추천·위험 데이터가 ALIRA 서버로 전송됩니다. "
+                       "추천 대체 담당자는 확정이 아니며, 사용 전 휴가자와 대체 담당자가 검토하세요.")
     else:
         st.caption("ALIRA 미설정 — 템플릿으로 생성합니다. ALIRA_API_BASE와 ALIRA_MODEL을 설정하면 ALIRA가 작성합니다. "
                    "데이터가 없는 항목은 '미입력'으로 표시됩니다.")
@@ -36,9 +40,16 @@ def render(team, rules):
     label = "🔄 다시 생성" if key in cache else "📝 인수인계 문서 생성"
     if st.button(label, key=f"ho_gen_{lid}", type="secondary" if key in cache else "primary"):
         if use_ai:
-            with st.spinner("ALIRA가 인수인계 문서를 작성하는 중입니다... (30초~1분)"):
-                cache[key] = generate_ai_handover(team, lv["member_id"], lv["start"], lv["end"], lv["type"],
-                                                  current_date, rules)
+            status = st.status("인수인계 문서를 준비하고 있습니다", state="running", expanded=True)
+            status.write("현재 진행 버전의 업무 계획과 본인 실적을 정리하고 있습니다.")
+            status.write("휴가 기간 중 예정 일정과 인계가 필요한 특이사항을 확인합니다.")
+            status.write("ALIRA가 확인된 VACON 데이터만 바탕으로 문서를 작성합니다.")
+            cache[key] = generate_ai_handover(team, lv["member_id"], lv["start"], lv["end"], lv["type"],
+                                              current_date, rules)
+            if cache[key][1]:
+                status.update(label="인수인계 문서 작성 완료", state="complete", expanded=False)
+            else:
+                status.update(label="ALIRA 응답이 없어 기본 문서로 전환했습니다", state="error", expanded=False)
         else:
             cache[key] = (template, False)
         st.rerun()

@@ -1134,13 +1134,18 @@ def delete_version_worklog(project_id: int, phase: str, log_id: int, path=None) 
         return cur.rowcount > 0
 
 
-def replace_version_assignments(project_id: int, phase: str, assignments: list[dict], path=None) -> int:
+def replace_version_assignments(project_id: int, phase: str, assignments: list[dict], path=None,
+                                approved_rebalance: bool = False) -> int:
     if phase not in ("spec", "verify"):
         raise ValueError("업무 유형은 spec 또는 verify여야 합니다.")
+    approval_key = f"version_rebalance_approved:{int(project_id)}:{phase}"
     with connect(path) as c:
         project = c.execute("SELECT id FROM version_projects WHERE id=?", (int(project_id),)).fetchone()
         if not project:
             raise ValueError("버전을 찾을 수 없습니다.")
+        # Any ordinary reassignment invalidates a prior approval. The explicit
+        # vacation reallocation action can set it again in this same transaction.
+        c.execute("DELETE FROM settings WHERE key=?", (approval_key,))
         if phase == "verify":
             spec_plan = int(c.execute("SELECT COALESCE(SUM(total_tasks),0) FROM spec_workloads WHERE project_id=?", (int(project_id),)).fetchone()[0])
             spec_done = int(c.execute("SELECT COALESCE(SUM(completed_tasks),0) FROM spec_work_logs WHERE project_id=?", (int(project_id),)).fetchone()[0])
@@ -1176,7 +1181,18 @@ def replace_version_assignments(project_id: int, phase: str, assignments: list[d
                       (int(project_id), phase, subsystem_id, int(item["member_id"]), int(item.get("tasks", 0)),
                        int(item.get("functions", 0)), int(item.get("requirements", 0)), float(item.get("effort_score", 0)),
                        str(item.get("feasibility") or "판단 자료 부족"), str(item.get("rationale") or "")))
+        if approved_rebalance:
+            c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                      (approval_key, "approved"))
     return len(assignments)
+
+
+def has_version_rebalance_approval(project_id: int, phase: str, path=None) -> bool:
+    if phase not in ("spec", "verify"):
+        raise ValueError("업무 유형은 spec 또는 verify여야 합니다.")
+    key = f"version_rebalance_approved:{int(project_id)}:{phase}"
+    with connect(path) as c:
+        return c.execute("SELECT 1 FROM settings WHERE key=? AND value='approved'", (key,)).fetchone() is not None
 
 
 def list_version_assignments(project_id: int, phase: str, path=None) -> list[dict]:

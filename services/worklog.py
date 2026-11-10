@@ -440,7 +440,7 @@ def recommend_daily_count(team: TeamData, member_id: int, phase: str, subsystem:
         recent = daily[-RECOMMEND_RECENT_DAYS:]
         values = [v for _, v in recent]
         value = int(round(_median(values)))
-        return {"value": max(value, 1), "label": label, "scope": scope, "days": len(recent),
+        return {"value": max(value, 1), "median": _median(values), "label": label, "scope": scope, "days": len(recent),
                 "low": int(min(values)), "high": int(max(values)),
                 "period": (recent[0][0], recent[-1][0]),
                 "basis": (f"{scope}의 최근 활동일 {len(recent)}일({recent[0][0]}~{recent[-1][0]}) "

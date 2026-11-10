@@ -68,6 +68,28 @@ def _new_version_deadline_form():
             st.error(f"버전 또는 마감일을 등록하지 못했습니다: {exc}")
 
 
+def _edit_version_deadline_form(project):
+    with st.container(border=True, key="version_deadline_panel"):
+        st.markdown("### 버전 마감일")
+        st.caption("선택한 버전의 요구사양서 작성·동적 검증 마감일을 수정합니다.")
+        with st.form(f"edit_version_deadlines_{project['id']}"):
+            spec_col, verify_col = st.columns(2)
+            spec_due = spec_col.date_input(
+                "요구사양서 작성 마감일", value=project.get("spec_due"),
+                key=f"edit_spec_due_{project['id']}")
+            verify_due = verify_col.date_input(
+                "동적 검증 마감일", value=project.get("verify_due"),
+                key=f"edit_verify_due_{project['id']}")
+            save = st.form_submit_button("마감일 수정")
+        if save:
+            try:
+                _save_project(project, spec_due=spec_due, verify_due=verify_due)
+                st.success(f"{project['version']} 버전의 마감일을 저장했습니다.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"마감일을 저장하지 못했습니다: {exc}")
+
+
 def _schedule_and_workload(project, team):
     phase_sections = (("spec", "요구사양서 작성"), ("verify", "동적 검증"))
     with st.container(key="planning_phase_tabs"):
@@ -343,7 +365,7 @@ def _render_recommendations(project, team, allow_approval=True):
                     "배정 일감": row["tasks"] if phase == "spec" else "-",
                     "배정 함수": row["functions"] if phase == "verify" else "-",
                     "배정 요구사양서": row["requirements"] if phase == "verify" else "-",
-                    "현재 업무량(%)": row["load"], "남은 가용일": row["available_days"],
+                    "남은 가용일": row["available_days"],
                     "마감 잔여일": ("마감일 미등록" if row.get("deadline_days") is None else
                                    f"{abs(row['deadline_days'])}일 경과" if row["deadline_days"] < 0 else
                                    "오늘 마감" if row["deadline_days"] == 0 else f"{row['deadline_days']}일 남음"),
@@ -388,7 +410,7 @@ def _render_recommendations(project, team, allow_approval=True):
 
 
 def _render_pm_review_flow(project, stage):
-    with st.container(border=True):
+    with st.container(border=True, key="version_pm_review_panel"):
         st.markdown("### PM 검토 단계")
         st.caption("요구사양서 작성 검토를 완료한 뒤 동적 검증 검토를 진행합니다.")
         _render_pm_review_controls(project, stage)
@@ -470,7 +492,26 @@ def render(team, rules=None):
         return
     project = db.get_version_project(selected_id)
     stage = workflow_stage(project)
-    with st.container(border=True):
+    st.html("""
+    <style>
+      .st-key-version_progress_panel,
+      .st-key-version_progress_panel > div,
+      .st-key-version_deadline_panel,
+      .st-key-version_deadline_panel > div,
+      .st-key-version_pm_review_panel,
+      .st-key-version_pm_review_panel > div {
+        background-color: #ffffff !important;
+      }
+      .st-key-version_progress_panel,
+      .st-key-version_deadline_panel,
+      .st-key-version_pm_review_panel {
+        border: 1px solid #e7ebf0;
+        border-radius: 12px;
+        padding: 0.8rem 1rem;
+      }
+    </style>
+    """)
+    with st.container(border=True, key="version_progress_panel"):
         st.markdown("### 업무 진행 현황")
         st.info(stage["message"])
         spec_total, spec_done = stage["spec"]
@@ -485,6 +526,7 @@ def render(team, rules=None):
                          if h["field"] == "verify_spec_total_items" and str(h.get("new_value", "")).startswith("0 — 기존 공용값 분리")]
         if split_history:
             st.info("이전 화면에서 공용으로 쓰던 동적 검증 사양서 수는 변경 이력에 보관했습니다. 실제 동적 검증 목표 수를 별도 입력하세요.")
+    _edit_version_deadline_form(project)
     _render_pm_review_flow(project, stage)
     if WORKLOG_PAGE is not None:
         def open_worklog(version):

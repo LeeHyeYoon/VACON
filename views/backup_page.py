@@ -33,6 +33,7 @@ def _render_version_leave_coverage(team):
         selected["overlap_start"], selected["overlap_end"])
     st.divider()
     st.subheader("AI 추천 대체 업무")
+    st.caption("작성 일감과 검증 요구사양서의 일일 추천은 검증 업무 기록과 같은 담당자 전체 기록의 최근 활동일 중앙값을 사용하고, 남은 업무량과 가용 근무일을 반영해 상한을 둡니다. 휴가 기간이 겹치는 담당자는 후보에서 제외합니다. 함수 목표는 과거 함수 처리량을 기준으로 계산합니다.")
     phase = result.get("phase", selected["phase"])
     team_daily = result.get("team_daily_required", {})
     remaining_days = result.get("remaining_workdays", 0)
@@ -76,7 +77,7 @@ def _render_version_leave_coverage(team):
             saved_error = st.session_state.get(error_key)
             if saved_error and saved_error.get("fingerprint") == fingerprint:
                 st.error(f"ALIRA 후보 추천에 실패했습니다: {saved_error['message']}")
-            display_number = lambda value: "계산 불가" if value is None else f"하루 평균 {value:.1f}개"
+            display_number = lambda value: "계산 불가" if value is None else f"하루 평균 {value:g}개"
             if saved_ai:
                 row_by_id = {row["member_id"]: row for row in recommendations}
                 table = []
@@ -85,8 +86,10 @@ def _render_version_leave_coverage(team):
                     values = {"순위": len(table) + 1, "대체 담당자": row["담당자"]}
                     if phase == "spec":
                         values["하루 작성 목표"] = display_number(row.get("하루 작성 목표"))
+                        values["일일 작성 기준"] = row.get("일감 추천 근거") or "계획 잔량·가용 근무일"
                     else:
                         values["하루 검증 요구사양서"] = display_number(row.get("하루 검증 요구사양서 목표"))
+                        values["요구사양서 기준"] = row.get("검증 업무 기록과 같은 요구사양서 추천 기준") or "계획 잔량·가용 근무일"
                         values["하루 검증 함수"] = display_number(row.get("하루 검증 함수 목표"))
                     values["추천 사유"] = item["추천 사유"]
                     table.append(values)
@@ -94,7 +97,10 @@ def _render_version_leave_coverage(team):
         else:
             st.info("과거 처리 이력과 현재 배정 잔량을 확인할 수 있는 담당자가 없어 추천 수량을 만들지 않았습니다.")
     if result.get("confidence") == "예측 불가":
-        st.warning("동일 업무의 담당자별 실제 처리량 데이터가 부족해 완료 가능성을 예측할 수 없습니다. 일일 목표는 계획 잔여량과 근무일 기준 참고값입니다.")
+        if phase == "verify":
+            st.warning("마감 완료 가능성은 검증 함수 처리량 등 일부 이력이 부족해 확정할 수 없습니다. 하루 검증 요구사양서 추천값은 검증 업무 기록과 동일한 담당자 전체 기록 중앙값이며, 남은 수량과 실제 가용 근무일은 마감 판단에 반영됩니다.")
+        else:
+            st.warning("마감 완료 가능성은 일부 처리량 자료가 부족해 확정할 수 없습니다. 하루 작성 추천값은 검증 업무 기록과 동일한 담당자 전체 기록 중앙값이며, 남은 일감과 실제 가용 근무일은 마감 판단에 반영됩니다.")
     if result.get("mode") == "project_rebalance":
         if result.get("distribution_warnings"):
             for warning in result["distribution_warnings"]:
@@ -105,7 +111,8 @@ def _render_version_leave_coverage(team):
                                    key=f"scheduled_plan_approved_{selected['id']}")
             if st.button("승인 재분배안 저장", type="primary", disabled=not approved, key=f"scheduled_plan_save_{selected['id']}"):
                 try:
-                    count = db.replace_version_assignments(selected["project_id"], selected["phase"], project_assignments)
+                    count = db.replace_version_assignments(selected["project_id"], selected["phase"],
+                                                           project_assignments, approved_rebalance=True)
                     st.cache_data.clear()
                     st.success(f"PM 승인 재분배안 {count}건을 버전 업무 배정으로 저장했습니다.")
                     st.rerun()

@@ -34,20 +34,53 @@ def _apply_count(state_key, value):
     st.session_state[state_key] = value
 
 
-def _count_recommendation(team, member_id, phase, subsystem, entry_date, metric_keys):
+def _count_recommendation(team, member_id, phase, subsystem, entry_date, metric_keys, approved_assignment):
     """반영된 업무 로그 기준 하루 처리 개수 추천(작성: 완료 일감, 검증: 완료 요구사양서)."""
     metric = "completed_tasks" if phase == "spec" else "completed_requirements"
-    rec = recommend_daily_count(team, member_id, phase, subsystem, entry_date)
-    with st.container(border=True):
-        if rec is None:
-            st.caption(f"추천 {'완료 일감' if phase == 'spec' else '완료 요구사양서'} 개수: 반영된 업무 로그가 부족해 추천할 수 없습니다. "
-                       "(🗂️ 데이터 관리 › ALIRA 분석 및 업무 로그 미리보기 › 업무 로그 반영 후 표시)")
-            return
-        left, right = st.columns([4, 1], vertical_alignment="center")
-        left.markdown(f"**추천 {rec['label']} 개수: {rec['value']}개**")
-        left.caption(rec["basis"] + ". 반영된 시트 업무 로그 기준 참고값이며, 실제 완료한 개수로 수정해 저장하세요.")
-        right.button("추천값 입력", key=f"apply_rec_{metric_keys[metric]}", on_click=_apply_count,
-                     args=(metric_keys[metric], rec["value"]))
+    if not approved_assignment:
+        st.caption("PM 승인 재분배안 또는 업무 배정이 저장된 뒤 추천 개수를 표시합니다.")
+        return
+    # Match the personal whole-record median used by the vacation coverage page.
+    rec = recommend_daily_count(team, member_id, phase, None, entry_date)
+    if rec is None:
+        st.caption(f"추천 {'완료 일감' if phase == 'spec' else '완료 요구사양서'} 개수: 반영된 업무 로그가 부족해 추천할 수 없습니다. "
+                   "(🗂️ 데이터 관리 › ALIRA 분석 및 업무 로그 미리보기 › 업무 로그 반영 후 표시)")
+        return
+
+    card_key = "worklog-daily-recommendation"
+    button_key = f"apply_rec_{metric_keys[metric]}"
+    st.html(f"""
+    <style>
+      .st-key-{card_key} {{
+        background: #fff2f5;
+        border: 1px solid #f1c7d2;
+        border-radius: 12px;
+        padding: 0.8rem 1rem;
+      }}
+      .st-key-{card_key} .st-key-{button_key} button {{
+        min-height: 2.2rem;
+        padding: 0.35rem 0.8rem;
+        border: 1px solid #e9b2c0;
+        border-radius: 8px;
+        background: #f9dfe7;
+        color: #74394c;
+        font-weight: 600;
+      }}
+      .st-key-{card_key} .st-key-{button_key} button:hover {{
+        background: #f5d0dc;
+        border-color: #df9caf;
+        color: #5f293b;
+      }}
+    </style>
+    """)
+    with st.container(border=True, key=card_key, gap="small"):
+        title, action = st.columns([5, 1.4], vertical_alignment="center")
+        title.markdown(f"**추천 {rec['label']} 개수 · {rec['value']}개**")
+        with action:
+            with st.container(horizontal=True, horizontal_alignment="right"):
+                st.button("추천값 적용", key=button_key, type="secondary", width="content",
+                          on_click=_apply_count, args=(metric_keys[metric], rec["value"]))
+        st.caption(rec["basis"] + ". 반영된 시트 업무 로그 기준 참고값이며, 실제 완료한 개수로 수정해 저장하세요.")
 
 
 def _phase(project, team, phase):
@@ -95,29 +128,48 @@ def _phase(project, team, phase):
         return
     subsystem_key = f"perf_subsystem_{phase}_{project['id']}_{suffix}"
     assignments = db.list_version_assignments(project["id"], phase)
+    backup_assignments = db.list_version_backup_assignments(project["id"], phase)
+    assigned_subsystems = {str(row["subsystem"]).casefold() for row in assignments
+                           if int(row["member_id"]) == int(member_id)}
+    rebalance_approved = db.has_version_rebalance_approval(project["id"], phase)
+    approved_subsystems = (set(assigned_subsystems) if rebalance_approved else set())
+    approved_subsystems.update(str(row["subsystem"]).casefold() for row in backup_assignments
+                               if int(row["backup_member_id"]) == int(member_id)
+                               and row["leave_start"] <= entry_date <= row["leave_end"])
+    assigned_subsystems.update(approved_subsystems)
+    current_subsystem = st.session_state.get(subsystem_key)
+    if not selected and approved_subsystems and (not current_subsystem or current_subsystem.casefold() not in approved_subsystems):
+        chosen = next((name for name in workloads_by_name if name.casefold() in approved_subsystems), None)
+        if chosen:
+            st.session_state[subsystem_key] = chosen
+            default_sub = chosen
     project_signature = hashlib.sha256(repr((workloads, records, assignments)).encode("utf-8")).hexdigest()
     recommendation = _cached_recommendation(project["id"], phase, member_id, entry_date,
         project_signature, _team_signature(team), team)
+    st.html("""
+    <style>
+      .st-key-ai-subsystem-option-0,
+      .st-key-ai-subsystem-option-1,
+      .st-key-ai-subsystem-option-2 {
+        background: #f8faff;
+        border: 1px solid #e1eaf7;
+        border-radius: 9px;
+        padding: 0.65rem 0.8rem;
+      }
+    </style>
+    """)
     st.markdown("#### AI 서브시스템 추천")
     st.caption("추천은 업무 유형별 경험, 계획 진척도와 잔량, 마감일, 현재 업무량·부재, 최근 서브시스템 배정의 연속성 및 작성·검증 담당자 분리를 함께 고려합니다. 실적 건수는 업무량 신호이며 실력 점수가 아닙니다. 추천 결과는 참고용이며 PM이 최종 배정을 검토·승인합니다.")
     if recommendation["subsystem"]:
-        if recommendation["overloaded"]:
-            st.warning(f"{team.name(member_id)}님의 현재 업무 부담이 높습니다. 해당 담당자에게 추가 업무를 추천하지 않습니다.")
         top = recommendation["basis"][0]
-        if recommendation["overloaded"]:
-            st.warning(f"우선 지원 서브시스템: {top['subsystem']} · 상태: {top['status']}")
-        else:
-            st.success(f"추천 서브시스템: {top['subsystem']} · 상태: {top['status']}")
-        st.write(recommendation["reason"])
         if recommendation.get("separation_exception"):
             st.warning("작성·검증을 분리할 수 있는 적합 담당자가 확인되지 않았습니다. 동일 담당자 배정은 PM 예외 검토가 필요합니다.")
-        col = st.columns(6)
+        col = st.columns(5)
         col[0].metric("선택 날짜", entry_date.isoformat())
-        col[1].metric("현재 업무량", f"{recommendation['workload_pct']}%")
-        col[2].metric("최근 30일 작성 기록", f"{recommendation['recent_spec_records']}건")
-        col[3].metric("최근 30일 검증 기록", f"{recommendation['recent_verify_records']}건")
-        col[4].metric("현재 버전 같은 날짜 기록", f"{recommendation['same_day_records']}건")
-        col[5].metric("다른 버전 승인 업무 부담", f"{recommendation['cross_version_effort']:.1f}점")
+        col[1].metric("최근 30일 작성 기록", f"{recommendation['recent_spec_records']}건")
+        col[2].metric("최근 30일 검증 기록", f"{recommendation['recent_verify_records']}건")
+        col[3].metric("현재 버전 같은 날짜 기록", f"{recommendation['same_day_records']}건")
+        col[4].metric("다른 버전 승인 업무 부담", f"{recommendation['cross_version_effort']:.1f}점")
         if top["experience"]["versions"]:
             exp = top["experience"]
             volume = (f"완료 일감 {exp['spec_done']:g}개" if phase == "spec" else
@@ -127,9 +179,9 @@ def _phase(project, team, phase):
             st.caption("해당 담당자의 과거 이 유형·서브시스템 경험: 데이터 없음")
         if top["support_people"]:
             support = top["support_people"][0]
-            st.caption(f"대안 지원 담당자: {support['name']} · {support['basis']} · 업무량 {support['workload_pct']}%")
+            st.caption(f"대안 지원 담당자: {support['name']} · {support['basis']}")
         for index, item in enumerate(recommendation["basis"][:3]):
-            with st.container(border=True):
+            with st.container(border=True, key=f"ai-subsystem-option-{index}"):
                 st.markdown(f"**{item['priority']} · {item['subsystem']}**　`{item['status']}`")
                 detail = st.columns(4)
                 detail[0].metric("진척률", f"{item['progress']:.0%}")
@@ -139,7 +191,7 @@ def _phase(project, team, phase):
                 exp = item["experience"]
                 historical_volume = (f"완료 일감 {exp['spec_done']:g}개" if phase == "spec" else
                                      f"완료 요구사양서 {exp['verify_req_done']:g}개 · 함수 {exp['verify_func_done']:g}개")
-                st.caption(f"선택 담당자의 경험: {exp['versions']}개 버전 · {exp['days']}활동일 · {historical_volume}; 현재 업무 부담 {recommendation['workload_pct']}%; "
+                st.caption(f"선택 담당자의 경험: {exp['versions']}개 버전 · {exp['days']}활동일 · {historical_volume}; "
                            f"최근 해당 유형 기록 {recommendation['recent_phase_records']}건; 계획 대비 실적 {item['completed']}/{item['total']}")
                 rotation = item["rotation"]
                 recent_versions = ", ".join(rotation["recent_versions"]) if rotation["recent_versions"] else "없음"
@@ -158,7 +210,7 @@ def _phase(project, team, phase):
                     st.caption("반대 업무 담당자: " + ", ".join(item["counterpart_names"]))
                 support_people = item["support_people"]
                 if support_people:
-                    st.caption("분리·경험·업무량·부재를 고려한 대안 담당자: " + ", ".join(f"{x['name']} ({x['basis']}, 최근 해당 서브시스템 {len(x['recent_subsystem_versions'])}/3개 버전, 연속 {x['consecutive_subsystem_versions']}개 버전, 업무량 {x['workload_pct']}%)" for x in support_people[:2]))
+                    st.caption("분리·경험·업무량·부재를 고려한 대안 담당자: " + ", ".join(f"{x['name']} ({x['basis']}, 최근 해당 서브시스템 {len(x['recent_subsystem_versions'])}/3개 버전, 연속 {x['consecutive_subsystem_versions']}개 버전)" for x in support_people[:2]))
                 st.caption(item["reason"])
                 if recommendation["overloaded"]:
                     st.caption("과부하 상태여서 이 담당자에게 추가 배정을 추천하지 않습니다.")
@@ -174,7 +226,8 @@ def _phase(project, team, phase):
     for metric, key in metric_keys.items():
         st.session_state.setdefault(key, int(defaults.get(metric, 0) or 0))
     if not selected:
-        _count_recommendation(team, member_id, phase, subsystem, entry_date, metric_keys)
+        approved_assignment = (subsystem.casefold() in approved_subsystems)
+        _count_recommendation(team, member_id, phase, subsystem, entry_date, metric_keys, approved_assignment)
     with st.form(f"perf_form_{phase}_{project['id']}_{suffix}"):
         st.caption(f"선택: {entry_date} · {team.name(member_id)} · {subsystem}")
         task_detail = st.selectbox("세부 업무", db.ACTUAL_TASK_DETAILS[phase],

@@ -8,9 +8,9 @@ from data import db
 from .internal_projects import (is_internal_version, is_legacy_sheet_version, _subsystem_experience,
                                 _subsystem_rotation_history, recommend_distribution)
 from .risk import workdays
+from .worklog import recommend_daily_count
 
 UNIT_NAMES = {"김재강", "주해원", "황지원", "이혜윤"}
-RATE_LOOKBACK_DAYS = 180
 PM_MEMBER_NAME = "주해원"
 PM_ALLOCATION_WEIGHT = 1.2
 
@@ -86,13 +86,15 @@ def _history_rows(team, phase: str, path=None) -> list[dict]:
 
 
 def _rates(team, phase: str, as_of: date, holidays: set[str], path=None) -> dict:
-    """Person/subsystem pace based on actual records and available days in the latest 180 days."""
-    start = as_of - timedelta(days=RATE_LOOKBACK_DAYS - 1)
+    """Person/subsystem pace from all available actual history, including legacy Sheets versions."""
     rows = [r for r in _history_rows(team, phase, path)
-            if r["date"] and start <= r["date"] <= as_of and r["subsystem"]]
+            if r["date"] and r["date"] <= as_of and r["subsystem"]]
     grouped = defaultdict(list)
     for row in rows:
         grouped[(row["member_id"], row["subsystem"].casefold())].append(row)
+        # Use same-phase person-wide history when this person has no record for the
+        # requested subsystem. This remains grounded in recorded requirement/function counts.
+        grouped[(row["member_id"], "*")].append(row)
     metrics = ("tasks",) if phase == "spec" else ("requirements", "functions", "executed", "created", "modified", "deleted", "defects")
     result = {}
     for (member_id, subsystem), records in grouped.items():
@@ -123,6 +125,19 @@ def _rates(team, phase: str, as_of: date, holidays: set[str], path=None) -> dict
             "records": record_count, "available_days": available_days, "metric_breadth": breadth, "level": level,
             "from": begin}
     return result
+
+
+def _pace(phase_rates: dict, member_id: int, subsystem: str, metric: str):
+    """Return (rate, history, used_person_wide_fallback), preferring exact subsystem data."""
+    exact = phase_rates.get((int(member_id), str(subsystem or "").casefold()), {})
+    rate = exact.get("rates", {}).get(metric)
+    if rate and rate > 0:
+        return rate, exact, False
+    overall = phase_rates.get((int(member_id), "*"), {})
+    rate = overall.get("rates", {}).get(metric)
+    if rate and rate > 0:
+        return rate, overall, True
+    return None, exact or overall, bool(overall)
 
 
 def _capacity_days(team, member_id: int, start: date, end: date, holidays: set[str]) -> float:
@@ -295,9 +310,11 @@ def _recommend_unassigned_phase_rebalance(team, project: dict, phase: str, absen
                 "remaining_unallocated": 0, "summary": "마감일 내 완료 가능", "confidence": "높음",
                 "message": "버전 업무 계획에 미완료 잔여량이 없습니다."}
 
+    unavailable_during_leave = {int(row["member_id"]) for row in team.leave_records()
+                                if row["start"] <= leave_end and leave_start <= row["end"]}
     pm_ids = {int(person["id"]) for person in team.unit_members() if person["name"] == PM_MEMBER_NAME}
     recommendation = recommend_distribution(team, project, phase, adjusted, as_of, path,
-        exclude_member_ids={int(absent_member_id)},
+        exclude_member_ids={int(absent_member_id)} | unavailable_during_leave,
         member_weight_multipliers={mid: PM_ALLOCATION_WEIGHT for mid in pm_ids})
     rec_rows = recommendation["rows"]
     added = defaultdict(lambda: defaultdict(int))
@@ -340,6 +357,11 @@ def _recommend_unassigned_phase_rebalance(team, project: dict, phase: str, absen
             continue
         project_assignments.append({"member_id": member_id, "subsystem": project_totals[subsystem]["subsystem"],
                                     **{metric: int(metrics.get(metric, 0)) for metric in ("tasks", "functions", "requirements")}})
+    replacement_assignments = [
+        {"member_id": member_id, "subsystem": project_totals[subsystem]["subsystem"], **dict(metrics)}
+        for (member_id, subsystem), metrics in added.items()
+        if any(int(metrics.get(metric, 0) or 0) for metric in ("tasks", "requirements", "functions"))
+    ]
     rows = []
     rate_history = _rates(team, phase, as_of, set(str(v)[:10] for v in project.get("holidays", []) if v), path)
     commitments = _commitments(phase, path)
@@ -355,13 +377,12 @@ def _recommend_unassigned_phase_rebalance(team, project: dict, phase: str, absen
         expected_days = 0.0
         missing_rate = False
         for row in person_rows:
-            rates = rate_history.get((member_id, str(row["subsystem"]).casefold()), {}).get("rates", {})
             difficulty = max(1, int(next((w.get("difficulty", 1) for w in adjusted if w["subsystem"] == row["subsystem"]), 1)))
             for metric in (("tasks",) if phase == "spec" else ("requirements", "functions")):
                 amount = int(row.get(metric) or 0)
                 if amount <= 0:
                     continue
-                rate = rates.get(metric)
+                rate, _, _ = _pace(rate_history, member_id, row["subsystem"], metric)
                 if rate and rate > 0:
                     expected_days += amount * difficulty / rate
                 else:
@@ -370,10 +391,9 @@ def _recommend_unassigned_phase_rebalance(team, project: dict, phase: str, absen
         for work in commitments:
             if int(work["member_id"]) != member_id:
                 continue
-            history = rate_history.get((member_id, str(work["subsystem"]).casefold()), {}).get("rates", {})
             for metric in ("tasks", "requirements", "functions"):
                 amount = int(work.get(metric) or 0)
-                rate = history.get(metric)
+                rate, _, _ = _pace(rate_history, member_id, work["subsystem"], metric)
                 if amount and rate and rate > 0:
                     prior_days += amount / rate
                 elif amount:
@@ -406,7 +426,7 @@ def _recommend_unassigned_phase_rebalance(team, project: dict, phase: str, absen
     else:
         summary, saveable = "현재 인력으로 마감일 내 완료 어려움", False
     project_assignments.sort(key=lambda row: (str(row["subsystem"]).casefold(), int(row["member_id"])))
-    return {**base, "rows": rows, "assignments": [], "project_assignments": project_assignments,
+    return {**base, "rows": rows, "assignments": replacement_assignments, "project_assignments": project_assignments,
             "total_allocated": assigned_residual, "remaining_unallocated": max(0, total_demand-assigned_residual),
             "allocated_by_metric": allocated_by_metric,
             "remaining_by_metric": {metric: max(0, demand_by_metric[metric] - allocated_by_metric[metric]) for metric in metric_keys},
@@ -595,7 +615,18 @@ def _recommend_version_leave_coverage_totals(team, project: dict, absent_member_
     phase_experience = _subsystem_experience(phase, team, path)
     rotation = _subsystem_rotation_history(team, project["version"], path)
     existing = _commitments(phase, path)
-    candidate_ids = sorted(team.unit_pool() - {int(absent_member_id)})
+    unavailable_during_leave = {int(row["member_id"]) for row in team.leave_records()
+                                if row["start"] <= leave_end and leave_start <= row["end"]}
+    candidate_ids = sorted(team.unit_pool() - {int(absent_member_id)} - unavailable_during_leave)
+    if not candidate_ids:
+        remaining_by_metric = {metric: sum(int(item.get(metric, 0) or 0) for item in demands)
+                               for metric in (("tasks",) if phase == "spec" else ("requirements", "functions"))}
+        return {"phase": phase, "stage": context["stage"], "message": "휴가 기간에 업무를 맡을 수 있는 대체 담당자가 없습니다.",
+                "rows": [], "summary": "현재 인력으로 마감일 내 완료 어려움", "confidence": "평가 불가",
+                "due": due, "demand_by_metric": remaining_by_metric, "remaining_by_metric": remaining_by_metric,
+                "remaining_workdays": period_workdays}
+    daily_recommendations = {mid: recommend_daily_count(team, mid, phase, None, as_of)
+                             for mid in candidate_ids}
     due_start = max(as_of, leave_start)
     base_rows = {}
     for mid in candidate_ids:
@@ -612,9 +643,8 @@ def _recommend_version_leave_coverage_totals(team, project: dict, absent_member_
                 if not amount:
                     continue
                 existing_by_metric[metric] += amount
-                history = phase_rates.get((mid, str(work["subsystem"]).casefold()), {})
                 rate_metric = "tasks" if metric == "tasks" else metric
-                rate = history.get("rates", {}).get(rate_metric)
+                rate, _, _ = _pace(phase_rates, mid, work["subsystem"], rate_metric)
                 if rate and rate > 0:
                     effort_days += amount / rate
                 else:
@@ -641,8 +671,11 @@ def _recommend_version_leave_coverage_totals(team, project: dict, absent_member_
                 row = base_rows[mid]
                 if row["free_days"] <= 0:
                     continue
-                history = phase_rates.get((mid, subsystem_key))
-                rate = history.get("rates", {}).get(rate_name) if history else None
+                rate, history, used_person_wide = _pace(phase_rates, mid, subsystem, rate_name)
+                daily_rec = daily_recommendations.get(mid)
+                if rate_name in ("tasks", "requirements") and daily_rec:
+                    rate = float(daily_rec["value"])
+                    used_person_wide = True
                 if not rate or rate <= 0:
                     continue
                 exp = phase_experience.get((mid, subsystem_key), {"versions": 0, "records": 0, "days": 0})
@@ -651,19 +684,20 @@ def _recommend_version_leave_coverage_totals(team, project: dict, absent_member_
                 skill = int(team.skill_level(mid, subsystem))
                 factor = 1 + min(0.15, int(exp.get("versions", 0)) * 0.04) + min(0.12, skill * 0.04)
                 factor /= 1 + min(0.5, max(0, repeats - 1) * 0.12)
-                if member.get("name") == PM_MEMBER_NAME:
+                if row["name"] == PM_MEMBER_NAME:
                     factor *= PM_ALLOCATION_WEIGHT
                 weights[mid] = rate * row["free_days"] * factor
                 phase_name = "동적 검증" if phase == "verify" else "요구사양서 작성"
                 row["reasons"].append(f"{subsystem} {phase_name} 이력 {exp.get('versions', 0)}개 버전, 최근 반복 담당 {repeats}개 버전")
-                if member["name"] == PM_MEMBER_NAME:
+                if used_person_wide:
+                    row["reasons"].append(f"{subsystem} 이력이 없어 전체 과거 {phase_name} 실적 속도로 일일 처리량을 보완")
+                if row["name"] == PM_MEMBER_NAME:
                     row["reasons"].append("PM 업무 분담 요청을 반영해 추천 가중치 20% 상향")
             allocated = _split(amount, weights)
             for mid, quantity in allocated.items():
                 if quantity <= 0:
                     continue
-                history = phase_rates[(mid, subsystem_key)]
-                rate = history["rates"][rate_name]
+                rate, _, _ = _pace(phase_rates, mid, subsystem, rate_name)
                 base_rows[mid]["added"][metric] += quantity
                 allocation_details[(mid, subsystem)][metric] += quantity
                 base_rows[mid]["free_days"] = max(0.0, base_rows[mid]["free_days"] - quantity / rate)
@@ -675,35 +709,36 @@ def _recommend_version_leave_coverage_totals(team, project: dict, absent_member_
         added = dict(row["added"])
         expected_days = row["existing_days"]
         missing = list(row["unknown_existing"])
-        for metric in ("tasks", "requirements", "functions"):
-            quantity = int(added.get(metric, 0))
-            if not quantity:
+        for (member_id, subsystem), metrics in allocation_details.items():
+            if member_id != row["member_id"]:
                 continue
-            work_by_subsystem = defaultdict(int)
-            for demand in demands:
-                work_by_subsystem[demand["subsystem"].casefold()] += int(demand.get(metric, 0) or 0)
-            # Added effort is divided across the actual subsystem-specific rate rows assigned above.
-            remaining = quantity
-            for demand in demands:
-                part = min(remaining, int(demand.get(metric, 0) or 0))
-                if not part:
+            for metric in ("tasks", "requirements", "functions"):
+                quantity = int(metrics.get(metric, 0) or 0)
+                if not quantity:
                     continue
-                key = demand["subsystem"].casefold()
                 rate_metric = "tasks" if phase == "spec" else metric
-                rate = phase_rates.get((row["member_id"], key), {}).get("rates", {}).get(rate_metric)
+                rate, _, _ = _pace(phase_rates, member_id, subsystem, rate_metric)
                 if rate and rate > 0:
-                    expected_days += part / rate
+                    expected_days += quantity / rate
                 else:
-                    missing.append(f"{demand['subsystem']} {metric} 처리 속도")
-                remaining -= part
-                if remaining <= 0:
-                    break
+                    missing.append(f"{subsystem} {metric} 처리 속도")
         due_date = _completion_date(team, row["member_id"], due_start, due, expected_days, holidays) if not missing else None
-        histories = [phase_rates.get((row["member_id"], d["subsystem"].casefold())) for d in demands]
+        histories = [_pace(phase_rates, row["member_id"], d["subsystem"],
+                           "tasks" if phase == "spec" else "requirements")[1] for d in demands]
         histories = [h for h in histories if h]
+        used_general_history = any(
+            _pace(phase_rates, row["member_id"], d["subsystem"], metric)[2]
+            for d in demands
+            for metric in (("tasks",) if phase == "spec" else ("requirements", "functions"))
+            if int(d.get(metric, 0) or 0)
+        )
         proficiency = (histories[0]["level"] if histories else "평가 데이터 부족")
         if missing:
             confidence = "낮음 · 실제 처리 이력 부족"
+        elif used_general_history and recommend_daily_count(team, row["member_id"], phase, None, as_of):
+            confidence = "보통 · 개인 전체 실적 참고"
+        elif used_general_history:
+            confidence = "낮음 · 개인 전체 업무 처리량 참고"
         elif histories and any(h["level"] == "평가 데이터 부족" for h in histories):
             confidence = "낮음 · 이력 기준 미달"
         else:
@@ -713,17 +748,20 @@ def _recommend_version_leave_coverage_totals(team, project: dict, absent_member_
         final_func = int(total_existing.get("functions", 0)) + int(added.get("functions", 0))
         row_ready = due_date is not None and due_date <= due
         daily_rates = []
-        for demand in demands:
-            history = phase_rates.get((row["member_id"], demand["subsystem"].casefold()), {})
-            if phase == "spec":
-                rate = history.get("rates", {}).get("tasks")
+        if phase == "spec":
+            rec = recommend_daily_count(team, row["member_id"], "spec", None, as_of)
+            if rec:
+                daily_rates.append(f"전체 실적 일감 {rec['value']}개/일 · {rec['basis']}")
+        else:
+            req_rec = recommend_daily_count(team, row["member_id"], "verify", None, as_of)
+            if req_rec:
+                daily_rates.append(f"전체 실적 요구사양서 {req_rec['value']}개/일 · {req_rec['basis']}")
+            for demand in demands:
+                label, metric = "함수", "functions"
+                rate, history, used_person_wide = _pace(phase_rates, row["member_id"], demand["subsystem"], metric)
                 if rate:
-                    daily_rates.append(f"{demand['subsystem']} 일감 {rate:.2f}/일")
-            else:
-                for label, metric in (("요구사양서", "requirements"), ("함수", "functions")):
-                    rate = history.get("rates", {}).get(metric)
-                    if rate:
-                        daily_rates.append(f"{demand['subsystem']} {label} {rate:.2f}/일")
+                    basis = f"(전체 실적·{history.get('versions', 0)}개 버전)" if used_person_wide else ""
+                    daily_rates.append(f"{demand['subsystem']} {label} {rate:.2f}/일{basis}")
         output.append({"member_id": row["member_id"], "담당자": row["name"], "직무": row["role"],
             "기존 업무량": (f"요구사양서 {int(total_existing.get('requirements', 0))}개 · 함수 {int(total_existing.get('functions', 0))}개"
                           if phase == "verify" else f"일감 {int(total_existing.get('tasks', 0))}개"),
@@ -813,23 +851,10 @@ def _dailyize_coverage_result(team, project: dict, result: dict, leave_start: da
                 result["confidence"] = "예측 불가"
         return result
 
-    if result.get("mode") == "project_rebalance":
-        completed = defaultdict(lambda: defaultdict(int))
-        for log in db.list_version_worklogs(project["id"], phase, path):
-            key = (int(log["member_id"]), str(log["subsystem"]).casefold())
-            if phase == "spec":
-                completed[key]["tasks"] += int(log.get("completed_tasks") or 0)
-            else:
-                completed[key]["requirements"] += int(log.get("completed_requirements") or 0)
-                completed[key]["functions"] += int(log.get("completed_functions") or 0)
-        allocations = []
-        for row in result.get("project_assignments", []):
-            key = (int(row["member_id"]), str(row["subsystem"]).casefold())
-            allocations.append({"member_id": key[0], "subsystem": row["subsystem"],
-                **{metric: max(0, int(row.get(metric, 0) or 0) - int(completed[key].get(metric, 0)))
-                   for metric in metrics}})
-    else:
-        allocations = result.get("assignments", [])
+    # Use only the proposed replacement quantities for daily targets. In project
+    # rebalance mode, project_assignments also contains already completed work so
+    # it can be saved as a complete version plan; counting it here inflated goals.
+    allocations = result.get("assignments", [])
 
     by_person = defaultdict(lambda: defaultdict(int))
     for allocation in allocations:
@@ -849,16 +874,9 @@ def _dailyize_coverage_result(team, project: dict, result: dict, leave_start: da
     capacity_shortfall = False
     allocated_by_metric = {metric: sum(int(values.get(metric, 0)) for values in by_person.values()) for metric in metrics}
     receiving_ids = {mid for mid, values in by_person.items() if any(int(values.get(metric, 0)) for metric in metrics)}
-    pace_missing = any(int(row["member_id"]) in receiving_ids and
-                       ("낮음" in str(row.get("예측 신뢰도", "")) or
-                        str(row.get("예상 완료일", "")).startswith("실적 속도 부족"))
-                       for row in result["rows"])
+    pace_missing = False
     if not receiving_ids and any(int(demand.get(metric, 0) or 0) for metric in metrics):
         pace_missing = result.get("confidence") in ("낮음", "평가 불가", "예측 불가")
-    if any(int(demand.get(metric, 0) or 0) > allocated_by_metric[metric] for metric in metrics):
-        pace_missing = pace_missing or any("낮음" in str(row.get("예측 신뢰도", ""))
-                                           for row in result["rows"])
-
     for row in result["rows"]:
         mid = int(row["member_id"])
         member = member_by_id.get(mid, {})
@@ -870,10 +888,13 @@ def _dailyize_coverage_result(team, project: dict, result: dict, leave_start: da
         for item in commitments:
             if int(item["member_id"]) != mid:
                 continue
-            hist = rate_history.get((mid, str(item["subsystem"]).casefold()), {}).get("rates", {})
             for metric in metrics:
                 amount = int(item.get(metric, 0) or 0)
-                rate = hist.get(metric)
+                rate, _, _ = _pace(rate_history, mid, item["subsystem"], metric)
+                if metric == ("tasks" if phase == "spec" else "requirements"):
+                    rec = recommend_daily_count(team, mid, phase, None, as_of)
+                    if rec:
+                        rate = float(rec["value"])
                 if amount and rate and rate > 0:
                     committed_effort += amount / rate
                 elif amount:
@@ -881,6 +902,11 @@ def _dailyize_coverage_result(team, project: dict, result: dict, leave_start: da
         effective_days = max(0.0, scheduled_days - committed_effort)
         row["remaining_workdays"] = round(available_days, 1)
         row["effective_workdays"] = round(effective_days, 1) if not unknown_commitments else None
+        main_metric = "tasks" if phase == "spec" else "requirements" if phase == "verify" else None
+        historical_daily = recommend_daily_count(team, mid, phase, None, as_of) if main_metric else None
+        assigned_main = int(by_person[mid].get(main_metric, 0) or 0) if main_metric else 0
+        if historical_daily and effective_days > 0 and assigned_main > historical_daily["value"] * effective_days:
+            capacity_shortfall = True
         daily = {}
         for metric in metrics:
             amount = int(by_person[mid].get(metric, 0))
@@ -889,29 +915,43 @@ def _dailyize_coverage_result(team, project: dict, result: dict, leave_start: da
             daily[metric] = (amount / team_days if team_days > 0 else None) if amount else 0.0
         row["daily_targets"] = daily
         if phase == "spec":
+            task_recommendation = recommend_daily_count(team, mid, "spec", None, as_of)
+            if task_recommendation:
+                daily["tasks"] = float(task_recommendation["value"])
+                row["일감 추천 근거"] = (f"{task_recommendation['scope']} · 중앙값 {task_recommendation['median']:g}개 · "
+                                         f"최근 활동 {task_recommendation['days']}일")
             row["하루 작성 목표"] = daily.get("tasks")
         else:
+            # Use the same person-wide 30-active-day median as 검증 업무 기록.
+            req_recommendation = recommend_daily_count(team, mid, "verify", None, as_of)
+            if req_recommendation:
+                daily["requirements"] = float(req_recommendation["value"])
+                row["검증 업무 기록과 같은 요구사양서 추천 기준"] = (
+                    f"{req_recommendation['scope']} · 중앙값 {req_recommendation['median']:g}개 · "
+                    f"최근 활동 {req_recommendation['days']}일")
             row["하루 검증 요구사양서 목표"] = daily.get("requirements")
             row["하루 검증 함수 목표"] = daily.get("functions")
 
         required_effort = committed_effort
         has_personal_history = False
         for allocation in assignments_by_person.get(mid, []):
-            subsystem_key = str(allocation["subsystem"]).casefold()
-            hist = rate_history.get((mid, subsystem_key), {})
-            rates = hist.get("rates", {})
+            subsystem = allocation["subsystem"]
+            subsystem_key = str(subsystem).casefold()
+            hist = rate_history.get((mid, subsystem_key), {}) or rate_history.get((mid, "*"), {})
             if hist:
                 has_personal_history = True
             for metric in metrics:
                 amount = int(allocation.get(metric, 0) or 0)
                 if not amount:
                     continue
-                rate = rates.get(metric)
+                rate, _, _ = _pace(rate_history, mid, subsystem, metric)
+                if metric == main_metric and historical_daily:
+                    rate = float(historical_daily["value"])
                 if rate and rate > 0:
                     required_effort += amount * subsystem_difficulty.get(subsystem_key, 1) / rate
                 else:
                     pace_missing = True
-        if unknown_commitments or (any(by_person[mid].values()) and not has_personal_history):
+        if unknown_commitments or (any(by_person[mid].values()) and not has_personal_history and not historical_daily):
             pace_missing = True
         elif required_effort > scheduled_days + 1e-9:
             capacity_shortfall = True
