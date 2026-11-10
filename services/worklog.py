@@ -384,3 +384,65 @@ def recent_summary(team: TeamData, member_id: int, today: date, days: int = 14) 
         out["tracks"][track] = {"sum": {m: sum(_number(r.get(m)) for r in recs) for m in METRIC_COLS[track]},
                                 "by_version": by_ver, "last_date": max(r["date"] for r in recs)}
     return out
+
+
+# ---------- 검증 업무 기록: 일일 처리 개수 추천 ----------
+RECOMMEND_METRIC = {"spec": ("req", "issue", "완료 일감"), "verify": ("dynamic", "req", "완료 요구사양서")}
+RECOMMEND_MIN_DAYS = 3
+RECOMMEND_RECENT_DAYS = 30   # 기준별로 최근 활동일 30일만 사용해 현재 처리 속도를 반영한다
+
+
+def _daily_totals(rows: list[dict], metric: str) -> list[tuple[date, float]]:
+    totals: dict = {}
+    for r in rows:
+        totals[r["date"]] = totals.get(r["date"], 0.0) + _number(r.get(metric))
+    return sorted((d, v) for d, v in totals.items() if v > 0)
+
+
+def _median(values: list[float]) -> float:
+    s = sorted(values)
+    mid = len(s) // 2
+    return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
+
+
+def recommend_daily_count(team: TeamData, member_id: int, phase: str, subsystem: str | None = None,
+                          ref_date: date | None = None) -> dict | None:
+    """반영(승인)된 업무 로그로 하루 처리 개수를 추천한다.
+    phase='spec' → 요구사양서 작성 완료 일감 개수, phase='verify' → 동적 검증 완료 요구사양서 개수.
+    같은 담당자·서브시스템 → 같은 담당자 → 단위 검증 인원 전체 순으로 활동일이 3일 이상인 기준을 쓰고,
+    그 기준의 최근 활동일 30일의 일별 합계 중앙값을 추천값으로 한다. 샘플 데이터와 기준일 이후 기록은 제외한다."""
+    if phase not in RECOMMEND_METRIC:
+        raise ValueError("phase는 spec 또는 verify여야 합니다.")
+    track, metric, label = RECOMMEND_METRIC[phase]
+    ref_date = ref_date or _today()
+    rows = [r for r in _records(team) if r.get("track") == track and _text_value(r.get("source")) != "샘플"
+            and isinstance(r.get("date"), date) and r["date"] <= ref_date]
+    sub = _text_value(subsystem).casefold()
+    name = team.name(member_id)
+    pool = team.unit_pool() or {member_id}
+    scopes = []
+    if sub:
+        scopes.append((f"{name}님의 {subsystem} 기록",
+                       [r for r in rows if r.get("member_id") == member_id and _text_value(r.get("subsystem")).casefold() == sub]))
+    scopes.append((f"{name}님의 전체 기록", [r for r in rows if r.get("member_id") == member_id]))
+    scopes.append(("단위 검증 인원 전체 기록", [r for r in rows if r.get("member_id") in pool]))
+    for scope, scoped in scopes:
+        if scope.startswith("단위") and len(scoped):
+            # 인원 전체는 사람·날짜별 합계를 한 표본으로 본다.
+            by_member: dict = {}
+            for r in scoped:
+                by_member.setdefault(r.get("member_id"), []).append(r)
+            daily = sorted((d, v) for rs in by_member.values() for d, v in _daily_totals(rs, metric))
+        else:
+            daily = _daily_totals(scoped, metric)
+        if len(daily) < RECOMMEND_MIN_DAYS:
+            continue
+        recent = daily[-RECOMMEND_RECENT_DAYS:]
+        values = [v for _, v in recent]
+        value = int(round(_median(values)))
+        return {"value": max(value, 1), "label": label, "scope": scope, "days": len(recent),
+                "low": int(min(values)), "high": int(max(values)),
+                "period": (recent[0][0], recent[-1][0]),
+                "basis": (f"{scope}의 최근 활동일 {len(recent)}일({recent[0][0]}~{recent[-1][0]}) "
+                          f"일별 {label} 개수 중앙값 {_median(values):g}개 (범위 {min(values):g}~{max(values):g}개)")}
+    return None

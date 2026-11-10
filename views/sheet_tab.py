@@ -106,6 +106,8 @@ def _show_auto_log_plan(team, plan):
         st.warning(f"날짜 또는 담당자를 해석할 수 없어 제외한 행: {unresolved_rows}건")
     if plan.get("excluded_versions"):
         st.caption(f"T0700 이후 또는 버전이 불명확해 제외된 기록: {plan['excluded_versions']}건")
+    if plan["ready"]:
+        st.caption("반영하면 ✍️ 검증 업무 기록에서 담당자별 하루 처리 개수 추천(요구사양서 작성: 완료 일감, 동적 검증: 완료 요구사양서)에 이 데이터가 사용됩니다.")
     if plan["ready"] and st.button("업무 로그 반영", key="auto_log_apply", type="primary"):
         totals = {"added": 0, "updated": 0, "removed": 0}
         grouped = {}

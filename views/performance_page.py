@@ -6,6 +6,7 @@ from data import db
 from services.internal_projects import is_internal_version, recommend_subsystem
 from services.coverage import workflow_stage
 from services.models import today
+from services.worklog import recommend_daily_count
 from views.common import header, show_df
 from views.internal_work_page import _render_recommendations
 SPEC = [("completed_tasks", "완료 일감 개수"), ("new_requirements", "신규 요구사양 개수"), ("modified_requirements", "수정 요구사양 개수"), ("deleted_requirements", "삭제 요구사양 개수")]
@@ -27,6 +28,26 @@ def _cached_recommendation(project_id, phase, member_id, work_date, project_sign
 
 def _select_recommended_subsystem(state_key, subsystem):
     st.session_state[state_key] = subsystem
+
+
+def _apply_count(state_key, value):
+    st.session_state[state_key] = value
+
+
+def _count_recommendation(team, member_id, phase, subsystem, entry_date, metric_keys):
+    """반영된 업무 로그 기준 하루 처리 개수 추천(작성: 완료 일감, 검증: 완료 요구사양서)."""
+    metric = "completed_tasks" if phase == "spec" else "completed_requirements"
+    rec = recommend_daily_count(team, member_id, phase, subsystem, entry_date)
+    with st.container(border=True):
+        if rec is None:
+            st.caption(f"추천 {'완료 일감' if phase == 'spec' else '완료 요구사양서'} 개수: 반영된 업무 로그가 부족해 추천할 수 없습니다. "
+                       "(🗂️ 데이터 관리 › ALIRA 분석 및 업무 로그 미리보기 › 업무 로그 반영 후 표시)")
+            return
+        left, right = st.columns([4, 1], vertical_alignment="center")
+        left.markdown(f"**추천 {rec['label']} 개수: {rec['value']}개**")
+        left.caption(rec["basis"] + ". 반영된 시트 업무 로그 기준 참고값이며, 실제 완료한 개수로 수정해 저장하세요.")
+        right.button("추천값 입력", key=f"apply_rec_{metric_keys[metric]}", on_click=_apply_count,
+                     args=(metric_keys[metric], rec["value"]))
 
 
 def _phase(project, team, phase):
@@ -149,6 +170,11 @@ def _phase(project, team, phase):
     subsystem = st.selectbox("실적에 저장할 서브시스템", list(workloads_by_name),
         index=list(workloads_by_name).index(default_sub) if default_sub in workloads_by_name else 0,
         key=subsystem_key)
+    metric_keys = {metric: f"perf_{metric}_{phase}_{project['id']}_{suffix}" for metric, _ in phase_fields}
+    for metric, key in metric_keys.items():
+        st.session_state.setdefault(key, int(defaults.get(metric, 0) or 0))
+    if not selected:
+        _count_recommendation(team, member_id, phase, subsystem, entry_date, metric_keys)
     with st.form(f"perf_form_{phase}_{project['id']}_{suffix}"):
         st.caption(f"선택: {entry_date} · {team.name(member_id)} · {subsystem}")
         task_detail = st.selectbox("세부 업무", db.ACTUAL_TASK_DETAILS[phase],
@@ -157,7 +183,7 @@ def _phase(project, team, phase):
                                    key=f"perf_detail_{phase}_{project['id']}_{suffix}")
         fields = {"date": entry_date, "member_id": member_id, "subsystem": subsystem,
                   "task_detail": task_detail}; cols = st.columns(2)
-        for i, (metric, label) in enumerate(phase_fields): fields[metric] = cols[i % 2].number_input(label, min_value=0, value=int(defaults.get(metric, 0) or 0), step=1, key=f"perf_{metric}_{phase}_{project['id']}_{suffix}")
+        for i, (metric, label) in enumerate(phase_fields): fields[metric] = cols[i % 2].number_input(label, min_value=0, step=1, key=metric_keys[metric])
         fields["notes"] = st.text_area("특이사항", value=defaults.get("notes", ""), key=f"perf_notes_{phase}_{project['id']}_{suffix}")
         if st.form_submit_button("업무 실적 수정" if selected else "업무 실적 저장"):
             db.save_version_worklog(project["id"], phase, fields, log_id=selected["id"] if selected else None); st.cache_data.clear(); st.success("업무 실적을 저장했습니다."); st.rerun()
