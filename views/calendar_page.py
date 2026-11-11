@@ -6,16 +6,17 @@ from services import calendar as cal
 from services import risk
 from services.models import LEAVE_TYPES, today
 from services.validation import validate_leave
-from views.common import errors_box, fmt_date, fmt_leave, header, show_df
+from views.common import errors_box, fmt_date, fmt_leave, header, page_surface, show_df
 
 
 def render(team, rules):
     header("🗓️ 휴가 캘린더", "팀원별 부재 현황과 휴가 일정을 관리합니다.")
-    tab_view, tab_edit = st.tabs(["일정 조회", "등록 · 수정 · 삭제"])
-    with tab_view:
-        _view(team, rules)
-    with tab_edit:
-        _edit(team)
+    with page_surface("calendar"):
+        tab_view, tab_edit = st.tabs(["일정 조회", "등록 · 수정 · 삭제"])
+        with tab_view:
+            _view(team, rules)
+        with tab_edit:
+            _edit(team)
 
 
 def _view(team, rules):

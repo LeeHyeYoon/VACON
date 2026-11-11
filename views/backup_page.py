@@ -5,7 +5,37 @@ from data import db
 from services.models import TeamData
 from services.coverage import recommend_version_leave_coverage, scheduled_leave_targets
 from services import coverage_ai, llm_client
-from views.common import header, show_df
+from views.common import header, page_surface, show_df
+
+
+def _activate_session_daily_targets(selected, assignments, recommendations):
+    """Expose approved daily goals only for the current Streamlit session."""
+    key = (f"{selected['project_id']}:{selected['phase']}:{selected['member_id']}:"
+           f"{selected['leave_start']}:{selected['leave_end']}")
+    active = st.session_state.setdefault("pm_approved_daily_targets", {})
+    active[key] = {
+        "project_id": int(selected["project_id"]),
+        "phase": selected["phase"],
+        "absent_member_id": int(selected["member_id"]),
+        "leave_start": str(selected["leave_start"]),
+        "leave_end": str(selected["leave_end"]),
+        "assignments": [
+            {"member_id": int(row["member_id"]), "subsystem": str(row["subsystem"]).casefold(),
+             "tasks": int(row.get("tasks", 0) or 0),
+             "requirements": int(row.get("requirements", 0) or 0),
+             "functions": int(row.get("functions", 0) or 0)}
+            for row in assignments
+            if any(int(row.get(metric, 0) or 0) > 0 for metric in ("tasks", "requirements", "functions"))
+        ],
+        "daily_targets": {
+            int(row["member_id"]): {
+                "tasks": int(row.get("하루 작성 목표", 0) or 0),
+                "requirements": int(row.get("하루 검증 요구사양서 목표", 0) or 0),
+                "functions": int(row.get("하루 검증 함수 목표", 0) or 0),
+            }
+            for row in recommendations
+        },
+    }
 
 
 def _render_version_leave_coverage(team):
@@ -31,10 +61,16 @@ def _render_version_leave_coverage(team):
     project = db.get_version_project(selected["project_id"])
     result = recommend_version_leave_coverage(team, project, selected["member_id"],
         selected["overlap_start"], selected["overlap_end"])
+    phase = result.get("phase", selected["phase"])
+    demand = result.get("demand_by_metric", {})
+    if not any(int(value or 0) > 0 for value in demand.values()):
+        phase_label = "일감 작성" if phase == "spec" else "동적 검증"
+        st.info(f"휴가자의 {phase_label} 배정 업무가 모두 완료되어 대체 추천할 잔여 업무가 없습니다.")
+        st.caption(f"단계 마감일 {result.get('due') or '미등록'} · 대체 분배할 잔여 업무 없음")
+        return
     st.divider()
     st.subheader("AI 추천 대체 업무")
-    st.caption("작성 일감과 검증 요구사양서의 일일 추천은 검증 업무 기록과 같은 담당자 전체 기록의 최근 활동일 중앙값을 사용하고, 남은 업무량과 가용 근무일을 반영해 상한을 둡니다. 휴가 기간이 겹치는 담당자는 후보에서 제외합니다. 함수 목표는 과거 함수 처리량을 기준으로 계산합니다.")
-    phase = result.get("phase", selected["phase"])
+    st.caption("담당자별 최근 처리량 중앙값의 비율로 팀 전체 하루 필요량을 나눕니다. 휴가 기간이 겹치는 담당자는 대체 후보에서 제외합니다. PM 승인 배정은 실제 완료 실적이 기록될 때까지 잔여 업무로 표시합니다.")
     team_daily = result.get("team_daily_required", {})
     remaining_days = result.get("remaining_workdays", 0)
     if phase == "spec":
@@ -49,6 +85,7 @@ def _render_version_leave_coverage(team):
         st.write(f"**마감까지 실제 근무일:** {remaining_days}일 · **팀 전체 하루 필요량:** "
                  f"요구사양서 {req_text} · 함수 {func_text}")
     st.caption(f"마감일 {result.get('due') or '데이터 없음'} · 과거 실제 처리량 기준: {result['summary']} · 신뢰도 {result['confidence']}")
+    recommendations = []
     if result["rows"]:
         recommendations = [row for row in result["rows"]
                            if any(int(row.get(field, 0) or 0) for field in
@@ -60,6 +97,15 @@ def _render_version_leave_coverage(team):
             if saved_ai and saved_ai.get("fingerprint") != fingerprint:
                 st.session_state.pop(recommendation_key, None)
                 saved_ai = None
+            show_key = f"coverage_show_recommendations_{selected['id']}"
+            if st.session_state.get(show_key) != fingerprint:
+                if st.button("추천 대체 담당자 보기", icon=":material/person_search:",
+                             type="primary", width="stretch",
+                             key=f"coverage_show_button_{selected['id']}"):
+                    st.session_state[show_key] = fingerprint
+                else:
+                    st.caption("버튼을 누르면 ALIRA가 후보를 비교하고 추천 담당자를 표시합니다.")
+                    return
             error_key = f"coverage_ai_error_{selected['id']}"
             if st.session_state.get(error_key, {}).get("fingerprint") != fingerprint:
                 st.session_state.pop(error_key, None)
@@ -77,21 +123,19 @@ def _render_version_leave_coverage(team):
             saved_error = st.session_state.get(error_key)
             if saved_error and saved_error.get("fingerprint") == fingerprint:
                 st.error(f"ALIRA 후보 추천에 실패했습니다: {saved_error['message']}")
-            display_number = lambda value: "계산 불가" if value is None else f"하루 평균 {value:g}개"
+            display_number = lambda value: "계산 불가" if value is None else f"{int(value)}개/일"
             if saved_ai:
                 row_by_id = {row["member_id"]: row for row in recommendations}
                 table = []
                 for item in saved_ai["recommendations"]:
                     row = row_by_id[item["member_id"]]
-                    values = {"순위": len(table) + 1, "대체 담당자": row["담당자"]}
                     if phase == "spec":
-                        values["하루 작성 목표"] = display_number(row.get("하루 작성 목표"))
-                        values["일일 작성 기준"] = row.get("일감 추천 근거") or "계획 잔량·가용 근무일"
+                        values = {"대체 담당자": row["담당자"],
+                                  "하루 작성 추천 개수": display_number(row.get("하루 작성 목표"))}
                     else:
-                        values["하루 검증 요구사양서"] = display_number(row.get("하루 검증 요구사양서 목표"))
-                        values["요구사양서 기준"] = row.get("검증 업무 기록과 같은 요구사양서 추천 기준") or "계획 잔량·가용 근무일"
-                        values["하루 검증 함수"] = display_number(row.get("하루 검증 함수 목표"))
-                    values["추천 사유"] = item["추천 사유"]
+                        values = {"대체 담당자": row["담당자"],
+                                  "하루 검증 요구사양서 추천 개수": display_number(row.get("하루 검증 요구사양서 목표")),
+                                  "하루 검증 함수 추천 개수": display_number(row.get("하루 검증 함수 목표"))}
                     table.append(values)
                 show_df(pd.DataFrame(table))
         else:
@@ -112,7 +156,17 @@ def _render_version_leave_coverage(team):
             if st.button("승인 재분배안 저장", type="primary", disabled=not approved, key=f"scheduled_plan_save_{selected['id']}"):
                 try:
                     count = db.replace_version_assignments(selected["project_id"], selected["phase"],
-                                                           project_assignments, approved_rebalance=True)
+                        project_assignments, approved_rebalance=True,
+                        leave_coverage={"absent_member_id": selected["member_id"],
+                            "leave_start": selected["leave_start"], "leave_end": selected["leave_end"],
+                            "assignments": result.get("assignments", []),
+                            "daily_targets": [
+                                {"member_id": row["member_id"],
+                                 "requirements": row.get("하루 검증 요구사양서 목표", 0),
+                                 "functions": row.get("하루 검증 함수 목표", 0),
+                                 "tasks": row.get("하루 작성 목표", 0)}
+                                for row in recommendations]})
+                    _activate_session_daily_targets(selected, result.get("assignments", []), recommendations)
                     st.cache_data.clear()
                     st.success(f"PM 승인 재분배안 {count}건을 버전 업무 배정으로 저장했습니다.")
                     st.rerun()
@@ -122,14 +176,40 @@ def _render_version_leave_coverage(team):
             st.info("기존 완료 실적의 담당자와 새 잔여 업무를 모두 반영할 수 없어 저장할 재분배안이 없습니다.")
     else:
         assigned_rows = result.get("assignments", [])
-        if assigned_rows:
+        coverage_rows = result.get("coverage_assignments", [])
+        if assigned_rows or coverage_rows:
+            if coverage_rows and not assigned_rows:
+                st.info("현재 표시된 대체 업무는 이미 저장되어 있습니다. 아래에서 PM 승인 내용을 다시 확인할 수 있습니다.")
             approved = st.toggle("추천 분배안을 확인했고 PM 대체 배정으로 승인합니다.", key=f"scheduled_coverage_approved_{selected['id']}")
-            if st.button("승인 대체 배정 저장", type="primary", disabled=not approved, key=f"scheduled_coverage_save_{selected['id']}"):
+            if st.button("PM 승인 대체 업무 저장", type="primary", disabled=not approved, key=f"scheduled_coverage_save_{selected['id']}"):
                 try:
-                    count = db.save_version_backup_assignments(selected["project_id"], selected["phase"],
-                        selected["member_id"], selected["leave_start"], selected["leave_end"], assigned_rows)
+                    if assigned_rows:
+                        count = db.save_version_backup_assignments(selected["project_id"], selected["phase"],
+                            selected["member_id"], selected["leave_start"], selected["leave_end"], assigned_rows,
+                            replace_existing=True,
+                            daily_targets=[
+                                {"member_id": row["member_id"],
+                                 "requirements": row.get("하루 검증 요구사양서 목표", 0),
+                                 "functions": row.get("하루 검증 함수 목표", 0),
+                                 "tasks": row.get("하루 작성 목표", 0)}
+                                for row in recommendations])
+                        message = f"새 PM 승인 대체 배정 {count}건을 저장했습니다."
+                    else:
+                        count = db.confirm_version_backup_approval(selected["project_id"], selected["phase"],
+                            selected["member_id"], selected["leave_start"], selected["leave_end"])
+                        db.save_version_backup_daily_targets(selected["project_id"], selected["phase"],
+                            selected["member_id"], selected["leave_start"], selected["leave_end"], [
+                                {"member_id": row["member_id"],
+                                 "requirements": row.get("하루 검증 요구사양서 목표", 0),
+                                 "functions": row.get("하루 검증 함수 목표", 0),
+                                 "tasks": row.get("하루 작성 목표", 0)}
+                                for row in recommendations])
+                        message = ("기존 PM 승인 대체 업무를 다시 확인했습니다. 검증 업무 기록에 반영되어 있습니다."
+                                   if count else "해당 휴가 기간에 저장된 승인 배정을 찾지 못했습니다.")
+                    if assigned_rows or count:
+                        _activate_session_daily_targets(selected, result.get("assignments", []), recommendations)
                     st.cache_data.clear()
-                    st.success(f"PM 승인 대체 배정 {count}건을 저장했습니다.")
+                    st.success(message)
                     st.rerun()
                 except Exception as exc:
                     st.error(f"대체 배정을 저장하지 못했습니다: {exc}")
@@ -137,4 +217,5 @@ def _render_version_leave_coverage(team):
 
 def render(team: TeamData, rules):
     header("🤝 대체 담당자", "휴가 기간과 실제 버전 일정이 겹치는 네 명의 단위 검증 업무만 표시합니다.")
-    _render_version_leave_coverage(team)
+    with page_surface("backup"):
+        _render_version_leave_coverage(team)

@@ -61,7 +61,7 @@ MENU = [
     ("🤝 대체 담당자", "backup", backup_page),
     ("📝 인수인계", "handover", handover_page),
     ("📧 메일 요약", "mail", mail_page),
-    ("💬 AI 비서", "assistant", assistant_page),
+    ("💬 ALIRA 비서", "assistant", assistant_page),
     ("🗂️ 데이터 관리", "data", data_page),
 ]
 

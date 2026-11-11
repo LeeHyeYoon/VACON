@@ -382,6 +382,54 @@ def get_version_project(project_id, path=None) -> dict | None:
     return result
 
 
+def version_project_delete_impact(project_id: int, path=None) -> dict | None:
+    """Summarize records that are scoped to a version and removed by its deletion."""
+    child_tables = {
+        "version_task_schedules": "세부 업무 일정",
+        "version_subsystems": "서브시스템",
+        "spec_workloads": "요구사양서 작성 계획",
+        "verification_workloads": "동적 검증 계획",
+        "spec_work_logs": "요구사양서 작성 실적",
+        "version_dynamic_work_logs": "동적 검증 실적",
+        "version_assignments": "버전 담당 배정",
+        "version_backup_assignments": "대체 담당 배정",
+        "version_history": "변경 이력",
+    }
+    with connect(path) as c:
+        project = c.execute("SELECT id,version FROM version_projects WHERE id=?", (int(project_id),)).fetchone()
+        if not project:
+            return None
+        impact = {"version": project["version"], "project_id": int(project["id"]),
+                  "records": {label: int(c.execute(
+                      f"SELECT COUNT(*) FROM {table} WHERE project_id=?", (int(project_id),)
+                  ).fetchone()[0]) for table, label in child_tables.items()}}
+        impact["approval_settings"] = int(c.execute(
+            """SELECT COUNT(*) FROM settings WHERE key GLOB ? OR key GLOB ? OR key GLOB ?""",
+            (f"version_backup_daily_targets:{int(project_id)}:*",
+             f"version_rebalance_approved:{int(project_id)}:*",
+             f"version_rebalance_coverage:{int(project_id)}:*"),
+        ).fetchone()[0])
+        return impact
+
+
+def delete_version_project(project_id: int, path=None) -> dict | None:
+    """Delete one VACON version and its FK-cascaded plans, schedules and work logs."""
+    with connect(path) as c:
+        project = c.execute("SELECT id,version FROM version_projects WHERE id=?", (int(project_id),)).fetchone()
+        if not project:
+            return None
+        version = str(project["version"])
+        impact = version_project_delete_impact(project_id, path)
+        c.execute("DELETE FROM settings WHERE key GLOB ? OR key GLOB ? OR key GLOB ?",
+                  (f"version_backup_daily_targets:{int(project_id)}:*",
+                   f"version_rebalance_approved:{int(project_id)}:*",
+                   f"version_rebalance_coverage:{int(project_id)}:*"))
+        deleted = c.execute("DELETE FROM version_projects WHERE id=?", (int(project_id),))
+        if deleted.rowcount != 1:
+            raise RuntimeError("선택한 버전을 삭제하지 못했습니다.")
+        return impact
+
+
 def save_version_project(fields: dict, path=None, project_id: int | None = None) -> int:
     """버전 생성/수정. 일정 변경 이력은 보존하고 중복 버전을 방지한다."""
     version = str(fields.get("version", "")).strip()
@@ -635,7 +683,8 @@ def list_version_backup_assignments(project_id: int, phase: str | None = None, p
 
 
 def save_version_backup_assignments(project_id: int, phase: str, absent_member_id: int,
-                                    leave_start: date, leave_end: date, assignments: list[dict], path=None) -> int:
+                                    leave_start: date, leave_end: date, assignments: list[dict], path=None,
+                                    replace_existing: bool = False, daily_targets: list[dict] | None = None) -> int:
     """Persist PM-approved leave coverage separately from the primary project allocation."""
     if phase not in ("spec", "verify"):
         raise ValueError("업무 유형은 spec 또는 verify여야 합니다.")
@@ -650,6 +699,8 @@ def save_version_backup_assignments(project_id: int, phase: str, absent_member_i
             spec_done = int(c.execute("SELECT COALESCE(SUM(completed_tasks),0) FROM spec_work_logs WHERE project_id=?", (int(project_id),)).fetchone()[0])
             if spec_plan <= 0 or spec_done < spec_plan:
                 raise ValueError("요구사양서 작성 목표를 완료한 뒤 동적 검증 대체 배정을 승인할 수 있습니다.")
+            if project["spec_review_status"] != "완료":
+                raise ValueError("PM이 요구사양서 검토 완료 처리한 뒤 동적 검증 대체 배정을 승인할 수 있습니다.")
             verify_targets = c.execute("SELECT COALESCE(SUM(total_functions),0),COALESCE(SUM(total_requirements),0) FROM verification_workloads WHERE project_id=?", (int(project_id),)).fetchone()
             if int(verify_targets[0]) + int(verify_targets[1]) <= 0:
                 raise ValueError("먼저 서브시스템별 동적 검증 목표를 등록하세요.")
@@ -657,6 +708,12 @@ def save_version_backup_assignments(project_id: int, phase: str, absent_member_i
         allowed_names = {"김재강", "주해원", "황지원", "이혜윤"}
         if names.get(int(absent_member_id)) not in allowed_names:
             raise ValueError("단위 검증 휴가자는 지정 담당자 네 명 중에서 선택해야 합니다.")
+        if replace_existing:
+            c.execute("""DELETE FROM version_backup_assignments
+                         WHERE project_id=? AND phase=? AND absent_member_id=?
+                         AND leave_start=? AND leave_end=?""",
+                      (int(project_id), phase, int(absent_member_id),
+                       _iso(leave_start), _iso(leave_end)))
         table, task_metric = ("spec_workloads", "total_tasks") if phase == "spec" else ("verification_workloads", None)
         base = c.execute("""SELECT s.id AS subsystem_id,s.name,w.total_tasks AS tasks,
                             0 AS functions,0 AS requirements
@@ -717,7 +774,55 @@ def save_version_backup_assignments(project_id: int, phase: str, absent_member_i
                        leave_start.isoformat(), leave_end.isoformat(), requested["tasks"],
                        requested["functions"], requested["requirements"]))
             inserted += 1
+        target_key = (f"version_backup_daily_targets:{int(project_id)}:{phase}:{int(absent_member_id)}:"
+                      f"{_iso(leave_start)}:{_iso(leave_end)}")
+        if daily_targets is None:
+            c.execute("DELETE FROM settings WHERE key=?", (target_key,))
+        else:
+            target_payload = {"absent_member_id": int(absent_member_id), "leave_start": _iso(leave_start),
+                              "leave_end": _iso(leave_end), "daily_targets": [
+                                  {"member_id": int(row["member_id"]),
+                                   "requirements": int(row.get("requirements", 0) or 0),
+                                   "functions": int(row.get("functions", 0) or 0),
+                                   "tasks": int(row.get("tasks", 0) or 0)}
+                                  for row in daily_targets]}
+            c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                      (target_key, json.dumps(target_payload, ensure_ascii=False)))
     return inserted
+
+
+def confirm_version_backup_approval(project_id: int, phase: str, absent_member_id: int,
+                                    leave_start: date, leave_end: date, path=None) -> int:
+    """Refresh the approval timestamp for an already-saved vacation coverage plan."""
+    if phase not in ("spec", "verify"):
+        raise ValueError("업무 유형은 spec 또는 verify여야 합니다.")
+    with connect(path) as c:
+        cur = c.execute("""UPDATE version_backup_assignments SET approved_at=CURRENT_TIMESTAMP
+                           WHERE project_id=? AND phase=? AND absent_member_id=?
+                           AND leave_start=? AND leave_end=?""",
+                        (int(project_id), phase, int(absent_member_id),
+                         _iso(leave_start), _iso(leave_end)))
+        return cur.rowcount
+
+
+def save_version_backup_daily_targets(project_id: int, phase: str, absent_member_id: int,
+                                     leave_start: date, leave_end: date,
+                                     daily_targets: list[dict], path=None) -> None:
+    """Store the exact daily goals shown in the PM-approved leave recommendation."""
+    if phase not in ("spec", "verify"):
+        raise ValueError("업무 유형은 spec 또는 verify여야 합니다.")
+    key = (f"version_backup_daily_targets:{int(project_id)}:{phase}:{int(absent_member_id)}:"
+           f"{_iso(leave_start)}:{_iso(leave_end)}")
+    payload = {"absent_member_id": int(absent_member_id), "leave_start": _iso(leave_start),
+               "leave_end": _iso(leave_end), "daily_targets": [
+                   {"member_id": int(row["member_id"]),
+                    "requirements": int(row.get("requirements", 0) or 0),
+                    "functions": int(row.get("functions", 0) or 0),
+                    "tasks": int(row.get("tasks", 0) or 0)}
+                   for row in daily_targets]}
+    with connect(path) as c:
+        c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                  (key, json.dumps(payload, ensure_ascii=False)))
 
 
 def save_version_phase(fields: dict, phase: str, path=None) -> int:
@@ -1054,6 +1159,8 @@ def save_version_worklog(project_id: int, phase: str, fields: dict, log_id: int 
             verify_plan = c.execute("SELECT COALESCE(SUM(total_functions),0),COALESCE(SUM(total_requirements),0) FROM verification_workloads WHERE project_id=?", (int(project_id),)).fetchone()
             if spec_plan <= 0 or spec_done < spec_plan:
                 raise ValueError("요구사양서 작성 목표를 완료한 뒤 동적 검증 기록을 저장할 수 있습니다.")
+            if project["spec_review_status"] != "완료":
+                raise ValueError("PM이 요구사양서 검토 완료 처리한 뒤 동적 검증 기록을 저장할 수 있습니다.")
             if int(verify_plan[0]) + int(verify_plan[1]) <= 0:
                 raise ValueError("먼저 서브시스템별 동적 검증 목표를 등록하세요.")
         subsystem_id = _internal_subsystem(c, project_id, fields.get("subsystem", ""))
@@ -1135,26 +1242,29 @@ def delete_version_worklog(project_id: int, phase: str, log_id: int, path=None) 
 
 
 def replace_version_assignments(project_id: int, phase: str, assignments: list[dict], path=None,
-                                approved_rebalance: bool = False) -> int:
+                                approved_rebalance: bool = False, leave_coverage: dict | None = None) -> int:
     if phase not in ("spec", "verify"):
         raise ValueError("업무 유형은 spec 또는 verify여야 합니다.")
     approval_key = f"version_rebalance_approved:{int(project_id)}:{phase}"
+    coverage_key = f"version_rebalance_coverage:{int(project_id)}:{phase}"
     with connect(path) as c:
-        project = c.execute("SELECT id FROM version_projects WHERE id=?", (int(project_id),)).fetchone()
+        project = c.execute("SELECT id,spec_review_status FROM version_projects WHERE id=?", (int(project_id),)).fetchone()
         if not project:
             raise ValueError("버전을 찾을 수 없습니다.")
         # Any ordinary reassignment invalidates a prior approval. The explicit
         # vacation reallocation action can set it again in this same transaction.
-        c.execute("DELETE FROM settings WHERE key=?", (approval_key,))
+        c.execute("DELETE FROM settings WHERE key IN (?,?)", (approval_key, coverage_key))
         if phase == "verify":
             spec_plan = int(c.execute("SELECT COALESCE(SUM(total_tasks),0) FROM spec_workloads WHERE project_id=?", (int(project_id),)).fetchone()[0])
             spec_done = int(c.execute("SELECT COALESCE(SUM(completed_tasks),0) FROM spec_work_logs WHERE project_id=?", (int(project_id),)).fetchone()[0])
             if spec_plan <= 0 or spec_done < spec_plan:
                 raise ValueError("요구사양서 작성 목표를 완료한 뒤 동적 검증 담당자를 배정할 수 있습니다.")
+            if project["spec_review_status"] != "완료":
+                raise ValueError("PM이 요구사양서 검토 완료 처리한 뒤 동적 검증 담당자를 배정할 수 있습니다.")
         allowed_names = {"김재강", "주해원", "황지원", "이혜윤"}
+        names = {int(row["id"]): row["name"] for row in c.execute("SELECT id,name FROM members")}
         for item in assignments:
-            member = c.execute("SELECT name FROM members WHERE id=?", (int(item["member_id"]),)).fetchone()
-            if not member or member["name"] not in allowed_names:
+            if names.get(int(item["member_id"])) not in allowed_names:
                 raise ValueError("단위 검증 배정은 지정된 네 담당자에게만 할 수 있습니다.")
         if assignments:
             if phase == "spec":
@@ -1184,6 +1294,42 @@ def replace_version_assignments(project_id: int, phase: str, assignments: list[d
         if approved_rebalance:
             c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                       (approval_key, "approved"))
+            if leave_coverage:
+                absent_member_id = int(leave_coverage["absent_member_id"])
+                leave_start, leave_end = _iso(leave_coverage["leave_start"]), _iso(leave_coverage["leave_end"])
+                if _date(leave_end) < _date(leave_start):
+                    raise ValueError("휴가 종료일은 시작일보다 빠를 수 없습니다.")
+                if names.get(absent_member_id) not in allowed_names:
+                    raise ValueError("휴가자는 지정 단위 검증 담당자 네 명 중에서 선택해야 합니다.")
+                planned = {(int(item["member_id"]), str(item["subsystem"]).casefold()): item
+                           for item in assignments}
+                coverage_rows = []
+                for item in leave_coverage.get("assignments", []):
+                    member_id = int(item["member_id"])
+                    subsystem = str(item["subsystem"] or "").strip()
+                    if not subsystem or member_id == absent_member_id or names.get(member_id) not in allowed_names:
+                        raise ValueError("승인 대체 배정의 담당자 또는 서브시스템을 확인하세요.")
+                    phase_assignment = planned.get((member_id, subsystem.casefold()))
+                    if not phase_assignment:
+                        raise ValueError(f"{subsystem}의 PM 승인 버전 배정과 대체 기록이 일치하지 않습니다.")
+                    amounts = {"tasks": int(item.get("tasks", 0) or 0),
+                               "requirements": int(item.get("requirements", 0) or 0),
+                               "functions": int(item.get("functions", 0) or 0)}
+                    if any(amount < 0 or amount > int(phase_assignment.get(metric, 0) or 0)
+                           for metric, amount in amounts.items()):
+                        raise ValueError(f"{subsystem}의 대체 배정량이 PM 승인 배정량을 초과합니다.")
+                    if any(amounts.values()):
+                        coverage_rows.append({"member_id": member_id, "subsystem": subsystem, **amounts})
+                daily_targets = [{"member_id": int(row["member_id"]),
+                                  "requirements": int(row.get("requirements", 0) or 0),
+                                  "functions": int(row.get("functions", 0) or 0),
+                                  "tasks": int(row.get("tasks", 0) or 0)}
+                                 for row in leave_coverage.get("daily_targets", [])]
+                coverage_payload = {"absent_member_id": absent_member_id, "leave_start": leave_start,
+                                    "leave_end": leave_end, "assignments": coverage_rows,
+                                    "daily_targets": daily_targets}
+                c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                          (coverage_key, json.dumps(coverage_payload, ensure_ascii=False)))
     return len(assignments)
 
 
@@ -1193,6 +1339,85 @@ def has_version_rebalance_approval(project_id: int, phase: str, path=None) -> bo
     key = f"version_rebalance_approved:{int(project_id)}:{phase}"
     with connect(path) as c:
         return c.execute("SELECT 1 FROM settings WHERE key=? AND value='approved'", (key,)).fetchone() is not None
+
+
+def get_version_rebalance_coverage_approval(project_id: int, phase: str, path=None) -> dict | None:
+    """Return the vacation-scoped recipient/subsystem records saved with a PM rebalance approval."""
+    if phase not in ("spec", "verify"):
+        raise ValueError("업무 유형은 spec 또는 verify여야 합니다.")
+    key = f"version_rebalance_coverage:{int(project_id)}:{phase}"
+    with connect(path) as c:
+        row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    if not row:
+        return None
+    try:
+        value = json.loads(row["value"])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def get_version_backup_daily_target(project_id: int, phase: str, member_id: int,
+                                    entry_date: date, subsystem: str | None = None, path=None) -> dict | None:
+    """Read the exact integer daily goals that the PM approved for a substitute."""
+    if phase not in ("spec", "verify"):
+        raise ValueError("업무 유형은 spec 또는 verify여야 합니다.")
+    prefix = f"version_backup_daily_targets:{int(project_id)}:{phase}:*"
+    day = _iso(entry_date)
+    with connect(path) as c:
+        rows = [dict(row) for row in c.execute("SELECT key,value FROM settings WHERE key GLOB ?", (prefix,))]
+    totals = {"requirements": 0, "functions": 0, "tasks": 0}
+    matched = False
+    payloads = []
+    for row in rows:
+        try:
+            payloads.append(json.loads(row["value"]))
+        except (TypeError, json.JSONDecodeError):
+            continue
+    rebalance = get_version_rebalance_coverage_approval(project_id, phase, path)
+    if rebalance:
+        payloads.append(rebalance)
+    # A leave plan may have been re-approved through the full-project
+    # rebalance route after an earlier direct coverage approval. Use its latest
+    # representation once, instead of adding both sets of daily goals.
+    unique_payloads = {}
+    for payload in payloads:
+        identity = (payload.get("absent_member_id"), payload.get("leave_start"), payload.get("leave_end"))
+        unique_payloads[identity] = payload
+    for payload in unique_payloads.values():
+        if not str(payload.get("leave_start", "")) <= day <= str(payload.get("leave_end", "")):
+            continue
+        if subsystem:
+            subsystem_key = str(subsystem).casefold()
+            coverage_rows = payload.get("assignments", [])
+            has_rebalance_match = any(
+                int(item.get("member_id", 0)) == int(member_id)
+                and str(item.get("subsystem", "")).casefold() == subsystem_key
+                and any(int(item.get(metric, 0) or 0) > 0
+                        for metric in ("tasks", "requirements", "functions"))
+                for item in coverage_rows)
+            absent_id = payload.get("absent_member_id")
+            if not has_rebalance_match and absent_id is not None:
+                with connect(path) as c:
+                    has_direct_match = c.execute(
+                        """SELECT 1 FROM version_backup_assignments b
+                           JOIN version_subsystems s ON s.id=b.subsystem_id
+                           WHERE b.project_id=? AND b.phase=? AND b.absent_member_id=?
+                           AND b.backup_member_id=? AND b.leave_start=? AND b.leave_end=?
+                           AND s.name=? COLLATE NOCASE LIMIT 1""",
+                        (int(project_id), phase, int(absent_id), int(member_id),
+                         str(payload.get("leave_start")), str(payload.get("leave_end")), subsystem)).fetchone()
+                if not has_direct_match:
+                    continue
+            elif not has_rebalance_match:
+                continue
+        for target in payload.get("daily_targets", []):
+            if int(target.get("member_id", 0)) != int(member_id):
+                continue
+            matched = True
+            for metric in totals:
+                totals[metric] += int(target.get(metric, 0) or 0)
+    return totals if matched else None
 
 
 def list_version_assignments(project_id: int, phase: str, path=None) -> list[dict]:

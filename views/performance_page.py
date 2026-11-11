@@ -34,14 +34,22 @@ def _apply_count(state_key, value):
     st.session_state[state_key] = value
 
 
-def _count_recommendation(team, member_id, phase, subsystem, entry_date, metric_keys, approved_assignment):
+def _count_recommendation(team, member_id, phase, subsystem, entry_date, metric_keys,
+                          approved_assignment, approved_daily_target=None):
     """반영된 업무 로그 기준 하루 처리 개수 추천(작성: 완료 일감, 검증: 완료 요구사양서)."""
     metric = "completed_tasks" if phase == "spec" else "completed_requirements"
     if not approved_assignment:
-        st.caption("PM 승인 재분배안 또는 업무 배정이 저장된 뒤 추천 개수를 표시합니다.")
+        st.caption("대체 담당자 페이지에서 해당 날짜·서브시스템의 승인 대체 배정을 저장하면 추천 개수를 표시합니다.")
         return
-    # Match the personal whole-record median used by the vacation coverage page.
-    rec = recommend_daily_count(team, member_id, phase, None, entry_date)
+    metric_name = "tasks" if phase == "spec" else "requirements"
+    if approved_daily_target is not None:
+        rec = {"label": "PM 승인 하루 대체 목표",
+               "value": int(approved_daily_target.get(metric_name, 0) or 0),
+               "basis": "대체 담당자 페이지에서 PM이 승인한 동일 날짜의 하루 업무 목표"}
+    else:
+        # Legacy approvals have no saved daily target; keep the historical
+        # recommendation until the PM confirms the plan again.
+        rec = recommend_daily_count(team, member_id, phase, None, entry_date)
     if rec is None:
         st.caption(f"추천 {'완료 일감' if phase == 'spec' else '완료 요구사양서'} 개수: 반영된 업무 로그가 부족해 추천할 수 없습니다. "
                    "(🗂️ 데이터 관리 › ALIRA 분석 및 업무 로그 미리보기 › 업무 로그 반영 후 표시)")
@@ -129,14 +137,21 @@ def _phase(project, team, phase):
     subsystem_key = f"perf_subsystem_{phase}_{project['id']}_{suffix}"
     assignments = db.list_version_assignments(project["id"], phase)
     backup_assignments = db.list_version_backup_assignments(project["id"], phase)
-    assigned_subsystems = {str(row["subsystem"]).casefold() for row in assignments
-                           if int(row["member_id"]) == int(member_id)}
-    rebalance_approved = db.has_version_rebalance_approval(project["id"], phase)
-    approved_subsystems = (set(assigned_subsystems) if rebalance_approved else set())
-    approved_subsystems.update(str(row["subsystem"]).casefold() for row in backup_assignments
-                               if int(row["backup_member_id"]) == int(member_id)
-                               and row["leave_start"] <= entry_date <= row["leave_end"])
-    assigned_subsystems.update(approved_subsystems)
+    # Only a PM-approved substitute record for this person, date, and subsystem
+    # unlocks the daily-count recommendation. A regular version assignment is
+    # not a substitute approval and must never reveal a recommendation here.
+    approved_subsystems = {str(row["subsystem"]).casefold() for row in backup_assignments
+                           if int(row["backup_member_id"]) == int(member_id)
+                           and row["leave_start"] <= entry_date <= row["leave_end"]}
+    rebalance_coverage = db.get_version_rebalance_coverage_approval(project["id"], phase)
+    if (rebalance_coverage
+            and str(rebalance_coverage.get("leave_start", "")) <= entry_date.isoformat()
+            <= str(rebalance_coverage.get("leave_end", ""))):
+        for coverage in rebalance_coverage.get("assignments", []):
+            if (int(coverage.get("member_id", 0)) == int(member_id)
+                    and any(int(coverage.get(metric, 0) or 0) > 0
+                            for metric in ("tasks", "requirements", "functions"))):
+                approved_subsystems.add(str(coverage.get("subsystem") or "").casefold())
     current_subsystem = st.session_state.get(subsystem_key)
     if not selected and approved_subsystems and (not current_subsystem or current_subsystem.casefold() not in approved_subsystems):
         chosen = next((name for name in workloads_by_name if name.casefold() in approved_subsystems), None)
@@ -226,8 +241,29 @@ def _phase(project, team, phase):
     for metric, key in metric_keys.items():
         st.session_state.setdefault(key, int(defaults.get(metric, 0) or 0))
     if not selected:
-        approved_assignment = (subsystem.casefold() in approved_subsystems)
-        _count_recommendation(team, member_id, phase, subsystem, entry_date, metric_keys, approved_assignment)
+        # Recommendations are session-scoped: the PM must press the save button
+        # in this app run. Persisted approvals remain in DB, but do not revive a
+        # suggestion after Streamlit has been restarted.
+        approved_daily_target = None
+        subsystem_key_value = subsystem.casefold()
+        for plan in st.session_state.get("pm_approved_daily_targets", {}).values():
+            if (int(plan.get("project_id", 0)) != int(project["id"])
+                    or plan.get("phase") != phase
+                    or not str(plan.get("leave_start", "")) <= entry_date.isoformat()
+                    <= str(plan.get("leave_end", ""))):
+                continue
+            assignment_matches = any(
+                int(row.get("member_id", 0)) == int(member_id)
+                and str(row.get("subsystem", "")).casefold() == subsystem_key_value
+                and any(int(row.get(metric, 0) or 0) > 0
+                        for metric in ("tasks", "requirements", "functions"))
+                for row in plan.get("assignments", []))
+            if (assignment_matches and subsystem_key_value in approved_subsystems
+                    and int(member_id) in plan.get("daily_targets", {})):
+                approved_daily_target = plan["daily_targets"][int(member_id)]
+        approved_assignment = approved_daily_target is not None
+        _count_recommendation(team, member_id, phase, subsystem, entry_date, metric_keys,
+                              approved_assignment, approved_daily_target)
     with st.form(f"perf_form_{phase}_{project['id']}_{suffix}"):
         st.caption(f"선택: {entry_date} · {team.name(member_id)} · {subsystem}")
         task_detail = st.selectbox("세부 업무", db.ACTUAL_TASK_DETAILS[phase],

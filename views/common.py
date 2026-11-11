@@ -4,6 +4,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 import re
+from contextlib import contextmanager
 
 from services.risk import HIGH, INSUFFICIENT, LOW, MEDIUM, format_reasons
 
@@ -19,6 +20,25 @@ def header(title: str, caption: str = "") -> None:
     st.title(clean_title)
     if caption:
         st.caption(caption)
+
+
+@contextmanager
+def page_surface(key: str):
+    """Consistent white bordered surface for a page's primary content."""
+    surface_key = f"vacon_surface_{key}"
+    st.html(f"""
+    <style>
+      .st-key-{surface_key} {{
+        background: #ffffff;
+        border: 1px solid #e7ebf0;
+        border-radius: 12px;
+        padding: 1.15rem 1.25rem;
+        margin: 0.25rem 0 1rem;
+      }}
+    </style>
+    """)
+    with st.container(border=True, key=surface_key) as container:
+        yield container
 
 
 def fmt_date(d) -> str:

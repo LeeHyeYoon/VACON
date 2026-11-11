@@ -6,13 +6,13 @@ from datetime import date, timedelta
 
 from data import db
 from .internal_projects import (is_internal_version, is_legacy_sheet_version, _subsystem_experience,
-                                _subsystem_rotation_history, recommend_distribution)
+                                _subsystem_rotation_history, _split_units, _split_units_capped,
+                                recommend_distribution)
 from .risk import workdays
-from .worklog import recommend_daily_count
+from .worklog import recommend_daily_count, recommend_daily_median
 
 UNIT_NAMES = {"김재강", "주해원", "황지원", "이혜윤"}
 PM_MEMBER_NAME = "주해원"
-PM_ALLOCATION_WEIGHT = 1.2
 
 
 def _phase_totals(project_id: int, phase: str, path=None) -> dict:
@@ -31,7 +31,7 @@ def _phase_totals(project_id: int, phase: str, path=None) -> dict:
 
 
 def workflow_stage(project: dict, path=None) -> dict:
-    """Derive the actionable phase from plans and actual work, without manual PM collation gates."""
+    """Derive the active phase; PM spec review completion gates dynamic verification."""
     project_id = int(project["id"])
     spec = _phase_totals(project_id, "spec", path)["tasks"]
     spec_complete = spec[0] > 0 and spec[1] >= spec[0]
@@ -43,6 +43,9 @@ def workflow_stage(project: dict, path=None) -> dict:
     if not spec_complete:
         return {"stage": "spec_work", "phase": "spec", "spec": spec, "verify": verify,
                 "message": f"요구사양서 작성 단계 · 계획 {spec[0]}, 완료 {spec[1]}, 잔여 {max(0, spec[0]-spec[1])}"}
+    if project.get("spec_review_status") != "완료":
+        return {"stage": "spec_review", "phase": None, "spec": spec, "verify": verify,
+                "message": "요구사양서 작성 완료 · PM 검토 완료 후 동적 검증이 시작됩니다."}
     if verify_complete:
         return {"stage": "done", "phase": None, "spec": spec, "verify": verify,
                 "message": "등록된 동적 검증 목표를 모두 완료했습니다."}
@@ -253,10 +256,10 @@ def version_leave_options(project: dict, team, path=None, as_of: date | None = N
     return sorted(options, key=lambda row: (row["start"], row["member_name"].casefold()))
 
 
-def _recommend_unassigned_phase_rebalance(team, project: dict, phase: str, absent_member_id: int,
-                                          leave_start: date, leave_end: date, as_of: date,
-                                          context: dict, path=None) -> dict:
-    """Recommend redistributing the version's unassigned remaining plan when per-person scope is absent."""
+def _recommend_version_remaining_rebalance(team, project: dict, phase: str, absent_member_id: int,
+                                            leave_start: date, leave_end: date, as_of: date,
+                                            context: dict, path=None) -> dict:
+    """Redistribute all version remainder when the absent person's own scope has no residual."""
     workloads = db.list_version_workloads(project["id"], phase, path)
     logs = db.list_version_worklogs(project["id"], phase, path)
     done = defaultdict(lambda: defaultdict(int))
@@ -312,10 +315,17 @@ def _recommend_unassigned_phase_rebalance(team, project: dict, phase: str, absen
 
     unavailable_during_leave = {int(row["member_id"]) for row in team.leave_records()
                                 if row["start"] <= leave_end and leave_start <= row["end"]}
-    pm_ids = {int(person["id"]) for person in team.unit_members() if person["name"] == PM_MEMBER_NAME}
+    available_member_ids = team.unit_pool() - {int(absent_member_id)} - unavailable_during_leave
+    metric_names = ("tasks",) if phase == "spec" else ("requirements", "functions")
+    median_weights = {metric: {} for metric in metric_names}
+    for member_id in available_member_ids:
+        for metric in metric_names:
+            historical = recommend_daily_median(team, member_id, phase, metric, as_of)
+            if historical and historical.get("median", 0) > 0:
+                median_weights[metric][member_id] = float(historical["median"])
     recommendation = recommend_distribution(team, project, phase, adjusted, as_of, path,
         exclude_member_ids={int(absent_member_id)} | unavailable_during_leave,
-        member_weight_multipliers={mid: PM_ALLOCATION_WEIGHT for mid in pm_ids})
+        metric_weight_overrides=median_weights)
     rec_rows = recommendation["rows"]
     added = defaultdict(lambda: defaultdict(int))
     rationale = {}
@@ -468,8 +478,10 @@ def scheduled_leave_targets(team, as_of: date | None = None, path=None) -> list[
                 is_active = (stage["phase"] == phase)
                 pm_review_pending = (stage["spec"][0] > 0 and stage["spec"][1] >= stage["spec"][0]
                                      and project.get("spec_review_status") != "완료")
-                status_conflict = (stage["phase"] == "spec" and project.get("status") == "검증 진행 중")
-                is_waiting_for_gate = phase == "verify" and (pm_review_pending or status_conflict)
+                # Planned verify dates can overlap spec dates in legacy schedules.
+                # The actual workflow is sequential: do not surface a dynamic
+                # verification target until the PM has completed spec review.
+                is_waiting_for_gate = phase == "verify" and pm_review_pending
                 if not is_active and not is_waiting_for_gate:
                     continue
                 phase_assignments = db.list_version_assignments(project_id, phase, path)
@@ -491,15 +503,9 @@ def scheduled_leave_targets(team, as_of: date | None = None, path=None) -> list[
                     if is_waiting_for_gate:
                         spec_done, spec_target = stage["spec"][1], stage["spec"][0]
                         verify_owner_count = len({int(row["member_id"]) for row in phase_assignments})
-                        if spec_done < spec_target:
-                            reason = (f"버전 상태는 '{project.get('status')}'이지만 요구사양서 작성 실적은 "
-                                      f"{spec_done}/{spec_target}건(마감 {project.get('spec_due') or '미등록'})입니다. "
-                                      f"동적 검증 담당 배정 {verify_owner_count}명·실적 {len(phase_logs)}건이므로 "
-                                      "업무 기록 누락 여부 또는 버전 상태를 확인하세요.")
-                        else:
-                            reason = (f"요구사양서 작성은 {spec_done}/{spec_target}건 완료됐지만 PM 정리 상태가 "
-                                      f"'{project.get('spec_review_status', '대기')}'입니다. PM 정리 완료 후 동적 검증 대체 업무를 판단하세요. "
-                                      f"(동적 검증 담당 배정 {verify_owner_count}명·실적 {len(phase_logs)}건)")
+                        reason = (f"요구사양서 작성 {spec_done}/{spec_target}건 · PM 검토 상태 "
+                                  f"'{project.get('spec_review_status', '대기')}'입니다. PM 검토 완료 후 동적 검증 대체 업무를 판단하세요. "
+                                  f"(동적 검증 담당 배정 {verify_owner_count}명·실적 {len(phase_logs)}건)")
                     else:
                         reason = "등록된 버전별 업무 기간과 진행 단계가 휴가와 겹칩니다."
                 else:
@@ -509,7 +515,7 @@ def scheduled_leave_targets(team, as_of: date | None = None, path=None) -> list[
                     overlap_start, overlap_end = leave_start, leave_end
                     status = "확인 필요"
                     reason = "버전별 시작일 또는 마감일이 없어 휴가와 업무 일정이 겹치는지 판단할 수 없습니다. 누락된 일정을 등록하세요."
-                phase_label = "요구사양서 작성" if phase == "spec" else "동적 검증"
+                phase_label = "일감 작성" if phase == "spec" else "동적 검증"
                 targets.append({"id": f"{leave['id']}:{project_id}:{phase}", "leave_id": int(leave["id"]),
                     "member_id": member_id, "member_name": team.name(member_id), "leave_start": leave["start"],
                     "leave_end": leave["end"], "overlap_start": overlap_start, "overlap_end": overlap_end,
@@ -525,6 +531,11 @@ def scheduled_leave_targets(team, as_of: date | None = None, path=None) -> list[
     for rows in by_leave.values():
         for previous, following in zip(rows, rows[1:]):
             if previous["overlap_end"] < following["overlap_start"]:
+                continue
+            # Spec and dynamic verification windows for one version may overlap
+            # on the calendar by design. The actual handoff is controlled by
+            # spec completion and the PM review gate in workflow_stage().
+            if int(previous["project_id"]) == int(following["project_id"]):
                 continue
             project = next((p for p in projects if int(p["id"]) == following["project_id"]), {})
             next_phase_start = project.get("spec_start" if following["phase"] == "spec" else "verify_start")
@@ -569,7 +580,7 @@ def _recommend_version_leave_coverage_totals(team, project: dict, absent_member_
         # must not hide the recommendation. Rebuild the phase allocation from the
         # remaining project plan, exclude the vacationer, and let the PM approve the
         # resulting full replacement plan.
-        return _recommend_unassigned_phase_rebalance(team, project, phase, absent_member_id,
+        return _recommend_version_remaining_rebalance(team, project, phase, absent_member_id,
             leave_start, leave_end, as_of, context, path)
 
     holidays = set(str(value)[:10] for value in project.get("holidays", []) if value)
@@ -582,34 +593,67 @@ def _recommend_version_leave_coverage_totals(team, project: dict, absent_member_
 
     current_logs = _log_totals(phase, path)
     approved_backup = db.list_version_backup_assignments(project["id"], phase, path)
-    moved = defaultdict(lambda: defaultdict(int))
+    phase_logs = db.list_version_worklogs(project["id"], phase, path)
+    other_approved_allocated = defaultdict(lambda: defaultdict(int))
+    current_window_completed = defaultdict(lambda: defaultdict(int))
     for row in approved_backup:
         if int(row["absent_member_id"]) != int(absent_member_id):
             continue
-        key = str(row["subsystem"]).casefold()
+        subsystem = str(row["subsystem"]).strip()
+        key = subsystem.casefold()
+        backup_id = int(row["backup_member_id"])
+        is_current_window = row["leave_start"] == leave_start and row["leave_end"] == leave_end
+        worklog_start = row["leave_start"]
+        worklog_end = min(row["leave_end"], as_of)
+        logged = defaultdict(int)
+        if worklog_start <= worklog_end:
+            for log in phase_logs:
+                if (int(log["member_id"]) != backup_id
+                        or str(log["subsystem"]).strip().casefold() != key
+                        or not worklog_start <= log["date"] <= worklog_end):
+                    continue
+                for metric, field in (("tasks", "completed_tasks"),
+                                      ("requirements", "completed_requirements"),
+                                      ("functions", "completed_functions")):
+                    logged[metric] += int(log.get(field) or 0)
         for metric, column in (("tasks", "allocated_tasks"), ("functions", "allocated_functions"),
                                ("requirements", "allocated_requirements")):
-            moved[key][metric] += int(row.get(column) or 0)
-    demands = []
+            quantity = int(row.get(column) or 0)
+            done = min(quantity, logged[metric])
+            if is_current_window:
+                current_window_completed[(backup_id, key)][metric] += done
+            else:
+                other_approved_allocated[key][metric] += quantity
+    demands, total_demands = [], []
     for assignment in target_assignments:
         subsystem = str(assignment["subsystem"] or "").strip()
         key = (int(project["id"]), subsystem.casefold(), int(absent_member_id))
+        total_demand = {"subsystem": subsystem}
         if phase == "spec":
-            quantity = max(0, int(assignment.get("allocated_tasks") or 0) - int(current_logs[key].get("tasks", 0)) - moved[subsystem.casefold()]["tasks"])
-            if quantity:
-                demands.append({"subsystem": subsystem, "tasks": quantity})
+            metric, field = "tasks", "allocated_tasks"
+            original = max(0, int(assignment.get(field) or 0) - int(current_logs[key].get(metric, 0)))
+            total_demand[metric] = max(0, original - other_approved_allocated[subsystem.casefold()][metric]
+                                       - sum(values[metric] for (member, sub), values in current_window_completed.items()
+                                             if sub == subsystem.casefold()))
         else:
-            requirements = max(0, int(assignment.get("allocated_requirements") or 0)
-                               - int(current_logs[key].get("requirements", 0)) - moved[subsystem.casefold()]["requirements"])
-            functions = max(0, int(assignment.get("allocated_functions") or 0)
-                            - int(current_logs[key].get("functions", 0)) - moved[subsystem.casefold()]["functions"])
-            if requirements or functions:
-                demands.append({"subsystem": subsystem, "requirements": requirements, "functions": functions})
-    if not any(any(int(v or 0) for k, v in d.items() if k != "subsystem") for d in demands):
-        return {"phase": phase, "stage": context["stage"], "message": "휴가자의 PM 승인 업무 중 완료되지 않은 잔여량이 없습니다.",
-                "rows": [], "summary": "마감일 내 완료 가능", "confidence": "높음",
-                "demand_by_metric": {"tasks": 0} if phase == "spec" else {"requirements": 0, "functions": 0},
-                "allocated_by_metric": {}, "remaining_by_metric": {}}
+            for metric, field in (("requirements", "allocated_requirements"),
+                                  ("functions", "allocated_functions")):
+                original = max(0, int(assignment.get(field) or 0)
+                               - int(current_logs[key].get(metric, 0)))
+                completed_here = sum(values[metric] for (member, sub), values in current_window_completed.items()
+                                     if sub == subsystem.casefold())
+                total_demand[metric] = max(0, original - other_approved_allocated[subsystem.casefold()][metric]
+                                           - completed_here)
+        if any(int(v or 0) for k, v in total_demand.items() if k != "subsystem"):
+            total_demands.append(total_demand)
+            demands.append(dict(total_demand))
+    if not total_demands:
+        # The vacationer's personal allocation may already be complete while
+        # other work in the active version remains. In that case, redistribute
+        # the version remainder across available staff instead of reporting a
+        # false zero-work state.
+        return _recommend_version_remaining_rebalance(team, project, phase, absent_member_id,
+            leave_start, leave_end, as_of, context, path)
 
     phase_rates = _rates(team, phase, as_of, holidays, path)
     phase_experience = _subsystem_experience(phase, team, path)
@@ -625,8 +669,19 @@ def _recommend_version_leave_coverage_totals(team, project: dict, absent_member_
                 "rows": [], "summary": "현재 인력으로 마감일 내 완료 어려움", "confidence": "평가 불가",
                 "due": due, "demand_by_metric": remaining_by_metric, "remaining_by_metric": remaining_by_metric,
                 "remaining_workdays": period_workdays}
-    daily_recommendations = {mid: recommend_daily_count(team, mid, phase, None, as_of)
-                             for mid in candidate_ids}
+    metric_names = ("tasks",) if phase == "spec" else ("requirements", "functions")
+    daily_recommendations = {
+        mid: {metric: recommend_daily_median(team, mid, phase, metric, as_of) for metric in metric_names}
+        for mid in candidate_ids
+    }
+    metric_quota_remaining = {}
+    for metric in metric_names:
+        total = sum(int(item.get(metric, 0) or 0) for item in demands)
+        weights = {mid: float(daily_recommendations[mid][metric]["median"])
+                   for mid in candidate_ids if daily_recommendations[mid][metric]
+                   and float(daily_recommendations[mid][metric].get("median", 0) or 0) > 0}
+        metric_quota_remaining[metric] = (_split_units(total, weights)
+                                          if total > 0 and weights else {mid: 0 for mid in candidate_ids})
     due_start = max(as_of, leave_start)
     base_rows = {}
     for mid in candidate_ids:
@@ -665,42 +720,40 @@ def _recommend_version_leave_coverage_totals(team, project: dict, absent_member_
             amount = int(demand.get(metric, 0) or 0)
             if not amount:
                 continue
-            rate_name = "tasks" if phase == "spec" else metric
             weights = {}
+            recommendation_rates = {}
             for mid in candidate_ids:
                 row = base_rows[mid]
-                if row["free_days"] <= 0:
+                daily_rec = daily_recommendations.get(mid, {}).get(metric)
+                if not daily_rec or float(daily_rec.get("median", 0) or 0) <= 0:
                     continue
-                rate, history, used_person_wide = _pace(phase_rates, mid, subsystem, rate_name)
-                daily_rec = daily_recommendations.get(mid)
-                if rate_name in ("tasks", "requirements") and daily_rec:
-                    rate = float(daily_rec["value"])
-                    used_person_wide = True
-                if not rate or rate <= 0:
-                    continue
+                rate = float(daily_rec["median"])
+                recommendation_rates[mid] = rate
                 exp = phase_experience.get((mid, subsystem_key), {"versions": 0, "records": 0, "days": 0})
                 version_hist = rotation.get((mid, subsystem_key), {})
                 repeats = int(version_hist.get("verify_consecutive_versions" if phase == "verify" else "spec_consecutive_versions", 0))
-                skill = int(team.skill_level(mid, subsystem))
-                factor = 1 + min(0.15, int(exp.get("versions", 0)) * 0.04) + min(0.12, skill * 0.04)
-                factor /= 1 + min(0.5, max(0, repeats - 1) * 0.12)
-                if row["name"] == PM_MEMBER_NAME:
-                    factor *= PM_ALLOCATION_WEIGHT
-                weights[mid] = rate * row["free_days"] * factor
+                weights[mid] = rate
                 phase_name = "동적 검증" if phase == "verify" else "요구사양서 작성"
                 row["reasons"].append(f"{subsystem} {phase_name} 이력 {exp.get('versions', 0)}개 버전, 최근 반복 담당 {repeats}개 버전")
-                if used_person_wide:
-                    row["reasons"].append(f"{subsystem} 이력이 없어 전체 과거 {phase_name} 실적 속도로 일일 처리량을 보완")
-                if row["name"] == PM_MEMBER_NAME:
-                    row["reasons"].append("PM 업무 분담 요청을 반영해 추천 가중치 20% 상향")
-            allocated = _split(amount, weights)
+                row["reasons"].append(f"과거 일일 처리량 중앙값 {rate:g}개를 배분 비율에 반영")
+                if row["free_days"] <= 0:
+                    row["reasons"].append("기존 업무 부담이 높아 마감 가능성을 별도로 확인할 필요")
+                if row["unknown_existing"]:
+                    row["reasons"].append("기존 업무 일부의 처리 이력이 없어 마감 예측 신뢰도가 낮음")
+            allocated = _split_units_capped(amount, weights, metric_quota_remaining[metric])
+            for mid, quantity in allocated.items():
+                metric_quota_remaining[metric][mid] -= quantity
             for mid, quantity in allocated.items():
                 if quantity <= 0:
                     continue
-                rate, _, _ = _pace(phase_rates, mid, subsystem, rate_name)
+                rate = recommendation_rates.get(mid)
                 base_rows[mid]["added"][metric] += quantity
                 allocation_details[(mid, subsystem)][metric] += quantity
-                base_rows[mid]["free_days"] = max(0.0, base_rows[mid]["free_days"] - quantity / rate)
+                recommendation_rate = recommendation_rates.get(mid, rate)
+                if recommendation_rate and recommendation_rate > 0:
+                    base_rows[mid]["free_days"] = max(
+                        0.0, base_rows[mid]["free_days"] - quantity / recommendation_rate
+                    )
 
     active = [row for row in base_rows.values()]
     output = []
@@ -724,11 +777,11 @@ def _recommend_version_leave_coverage_totals(team, project: dict, absent_member_
                     missing.append(f"{subsystem} {metric} 처리 속도")
         due_date = _completion_date(team, row["member_id"], due_start, due, expected_days, holidays) if not missing else None
         histories = [_pace(phase_rates, row["member_id"], d["subsystem"],
-                           "tasks" if phase == "spec" else "requirements")[1] for d in demands]
+                           "tasks" if phase == "spec" else "requirements")[1] for d in total_demands]
         histories = [h for h in histories if h]
         used_general_history = any(
             _pace(phase_rates, row["member_id"], d["subsystem"], metric)[2]
-            for d in demands
+            for d in total_demands
             for metric in (("tasks",) if phase == "spec" else ("requirements", "functions"))
             if int(d.get(metric, 0) or 0)
         )
@@ -756,7 +809,7 @@ def _recommend_version_leave_coverage_totals(team, project: dict, absent_member_
             req_rec = recommend_daily_count(team, row["member_id"], "verify", None, as_of)
             if req_rec:
                 daily_rates.append(f"전체 실적 요구사양서 {req_rec['value']}개/일 · {req_rec['basis']}")
-            for demand in demands:
+            for demand in total_demands:
                 label, metric = "함수", "functions"
                 rate, history, used_person_wide = _pace(phase_rates, row["member_id"], demand["subsystem"], metric)
                 if rate:
@@ -778,7 +831,7 @@ def _recommend_version_leave_coverage_totals(team, project: dict, absent_member_
             "현재 승인 업무 일수": round(row["existing_days"], 2),
             "예측 신뢰도": confidence, "추천 근거": "; ".join(dict.fromkeys(row["reasons"])) or "해당 서브시스템 실적 속도를 확인할 수 없어 추가 배정을 하지 않았습니다."})
 
-    demanded = sum(int(d.get(k, 0) or 0) for d in demands for k in ("tasks", "requirements", "functions"))
+    demanded = sum(int(d.get(k, 0) or 0) for d in total_demands for k in ("tasks", "requirements", "functions"))
     assigned = sum(int(r.get("추가 배정 일감", 0) or 0) + int(r.get("추가 배정 요구사양서", 0) or 0)
                    + int(r.get("추가 배정 함수", 0) or 0) for r in output)
     predictions = [r for r in output if int(r.get("추가 배정 일감", 0) or 0) + int(r.get("추가 배정 요구사양서", 0) or 0)
@@ -792,17 +845,30 @@ def _recommend_version_leave_coverage_totals(team, project: dict, absent_member_
     else:
         summary = "현재 인력으로 마감일 내 완료 어려움"
     if phase == "spec":
-        message = f"휴가자 잔여 작성 일감 {sum(int(d.get('tasks', 0) or 0) for d in demands)}개 중 {sum(int(r.get('추가 배정 일감', 0) or 0) for r in output)}개를 분배할 수 있습니다."
+        message = f"휴가자 미완료 작성 일감 {sum(int(d.get('tasks', 0) or 0) for d in total_demands)}개 중 {sum(int(r.get('추가 배정 일감', 0) or 0) for r in output)}개가 승인 배정되었거나 새로 분배됩니다."
     else:
-        message = (f"휴가자 잔여 검증 요구사양서 {sum(int(d.get('requirements', 0) or 0) for d in demands)}개와 "
-                   f"함수 {sum(int(d.get('functions', 0) or 0) for d in demands)}개를 각각 분배합니다.")
+        message = (f"휴가자 미완료 검증 요구사양서 {sum(int(d.get('requirements', 0) or 0) for d in total_demands)}개와 "
+                   f"함수 {sum(int(d.get('functions', 0) or 0) for d in total_demands)}개 중 승인 배정량과 새 분배량을 표시합니다.")
+    replacement_details = defaultdict(lambda: defaultdict(int))
+    for (mid, subsystem_key), metrics in current_window_completed.items():
+        subsystem = next((row["subsystem"] for row in approved_backup
+                          if int(row["absent_member_id"]) == int(absent_member_id)
+                          and int(row["backup_member_id"]) == mid
+                          and row["leave_start"] == leave_start and row["leave_end"] == leave_end
+                          and str(row["subsystem"]).casefold() == subsystem_key), subsystem_key)
+        for metric, quantity in metrics.items():
+            replacement_details[(mid, subsystem)][metric] += quantity
+    for (mid, subsystem), metrics in allocation_details.items():
+        for metric, quantity in metrics.items():
+            replacement_details[(mid, subsystem)][metric] += quantity
+
     return {"phase": phase, "stage": context["stage"], "stage_message": context["message"],
             "absent_member_id": int(absent_member_id), "absent_member": team.name(absent_member_id),
             "leave_start": leave_start, "leave_end": leave_end, "due": due,
-            "period_workdays": period_workdays, "demands": demands, "rows": output,
+            "period_workdays": period_workdays, "demands": total_demands, "new_demands": demands, "rows": output,
             "summary": summary, "confidence": "보통" if high_confidence else "낮음",
             "total_demand": demanded, "total_allocated": assigned,
-            "demand_by_metric": {metric: sum(int(d.get(metric, 0) or 0) for d in demands)
+            "demand_by_metric": {metric: sum(int(d.get(metric, 0) or 0) for d in total_demands)
                                  for metric in (("tasks",) if phase == "spec" else ("requirements", "functions"))},
             "allocated_by_metric": {
                 "tasks": sum(int(r.get("추가 배정 일감", 0) or 0) for r in output),
@@ -810,23 +876,26 @@ def _recommend_version_leave_coverage_totals(team, project: dict, absent_member_
                 "functions": sum(int(r.get("추가 배정 함수", 0) or 0) for r in output),
             },
             "assignments": [{"member_id": mid, "subsystem": subsystem, **dict(metrics)}
-                            for (mid, subsystem), metrics in sorted(allocation_details.items(), key=lambda item: (item[0][1].casefold(), item[0][0]))],
+                            for (mid, subsystem), metrics in sorted(replacement_details.items(), key=lambda item: (item[0][1].casefold(), item[0][0]))],
+            "coverage_assignments": [{"member_id": mid, "subsystem": subsystem, **dict(metrics)}
+                                     for (mid, subsystem), metrics in sorted(allocation_details.items(), key=lambda item: (item[0][1].casefold(), item[0][0]))],
             "remaining_unallocated": max(0, demanded-assigned),
             "remaining_by_metric": {
-                "tasks": max(0, sum(int(d.get("tasks", 0) or 0) for d in demands)
+                "tasks": max(0, sum(int(d.get("tasks", 0) or 0) for d in total_demands)
                                - sum(int(r.get("추가 배정 일감", 0) or 0) for r in output)),
-                "requirements": max(0, sum(int(d.get("requirements", 0) or 0) for d in demands)
+                "requirements": max(0, sum(int(d.get("requirements", 0) or 0) for d in total_demands)
                                        - sum(int(r.get("추가 배정 요구사양서", 0) or 0) for r in output)),
-                "functions": max(0, sum(int(d.get("functions", 0) or 0) for d in demands)
+                "functions": max(0, sum(int(d.get("functions", 0) or 0) for d in total_demands)
                                     - sum(int(r.get("추가 배정 함수", 0) or 0) for r in output)),
             },
-            "message": "완료" if not demands else message}
+            "message": "완료" if not total_demands else message}
 
 
 def _dailyize_coverage_result(team, project: dict, result: dict, leave_start: date, as_of: date, path=None) -> dict:
     """Add deadline-based daily targets without mixing phase metrics in the UI."""
     phase = result.get("phase")
     due = result.get("due") or project.get("spec_due" if phase == "spec" else "verify_due")
+    result["due"] = due
     start = max(as_of, leave_start)
     holidays = {str(value)[:10] for value in project.get("holidays", []) if value}
     calendar_days = [day for day in workdays(start, due)] if phase and due and due >= start else []
@@ -854,7 +923,7 @@ def _dailyize_coverage_result(team, project: dict, result: dict, leave_start: da
     # Use only the proposed replacement quantities for daily targets. In project
     # rebalance mode, project_assignments also contains already completed work so
     # it can be saved as a complete version plan; counting it here inflated goals.
-    allocations = result.get("assignments", [])
+    allocations = result.get("coverage_assignments", result.get("assignments", []))
 
     by_person = defaultdict(lambda: defaultdict(int))
     for allocation in allocations:
@@ -917,18 +986,17 @@ def _dailyize_coverage_result(team, project: dict, result: dict, leave_start: da
         if phase == "spec":
             task_recommendation = recommend_daily_count(team, mid, "spec", None, as_of)
             if task_recommendation:
-                daily["tasks"] = float(task_recommendation["value"])
-                row["일감 추천 근거"] = (f"{task_recommendation['scope']} · 중앙값 {task_recommendation['median']:g}개 · "
-                                         f"최근 활동 {task_recommendation['days']}일")
+                row["일감 추천 근거"] = (f"과거 처리량 중앙값 {task_recommendation['median']:g}개/일을 "
+                                         "배분 가중치로 반영 · 표시 목표는 잔여 업무 배정량 기준")
             row["하루 작성 목표"] = daily.get("tasks")
         else:
-            # Use the same person-wide 30-active-day median as 검증 업무 기록.
+            # Historical throughput informs allocation and feasibility, but the
+            # displayed goal is each person's share of the team demand per workday.
             req_recommendation = recommend_daily_count(team, mid, "verify", None, as_of)
             if req_recommendation:
-                daily["requirements"] = float(req_recommendation["value"])
                 row["검증 업무 기록과 같은 요구사양서 추천 기준"] = (
-                    f"{req_recommendation['scope']} · 중앙값 {req_recommendation['median']:g}개 · "
-                    f"최근 활동 {req_recommendation['days']}일")
+                    f"과거 처리량 중앙값 {req_recommendation['median']:g}개/일을 "
+                    "배분 가중치로 반영 · 표시 목표는 잔여 업무 배정량 기준")
             row["하루 검증 요구사양서 목표"] = daily.get("requirements")
             row["하루 검증 함수 목표"] = daily.get("functions")
 
@@ -956,6 +1024,25 @@ def _dailyize_coverage_result(team, project: dict, result: dict, leave_start: da
         elif required_effort > scheduled_days + 1e-9:
             capacity_shortfall = True
 
+    for metric, output_key in (("tasks", "하루 작성 목표"),
+                               ("requirements", "하루 검증 요구사양서 목표"),
+                               ("functions", "하루 검증 함수 목표")):
+        if metric not in metrics:
+            continue
+        exact = [(row, row.get("daily_targets", {}).get(metric)) for row in result["rows"]]
+        if team_days <= 0 and any(value for _, value in exact):
+            for row, value in exact:
+                row[output_key] = None if value else 0
+            continue
+        floors = {int(row["member_id"]): int(value or 0) for row, value in exact}
+        target_total = int(sum(float(value or 0) for _, value in exact) + 0.5)
+        remainder = max(0, target_total - sum(floors.values()))
+        ordered = sorted(exact, key=lambda item: (
+            -(float(item[1] or 0) - int(float(item[1] or 0))), int(item[0]["member_id"])))
+        add_one = {int(row["member_id"]) for row, _ in ordered[:remainder]}
+        for row, value in exact:
+            row[output_key] = (floors[int(row["member_id"])] + (1 if int(row["member_id"]) in add_one else 0))
+
     result["allocated_by_metric"] = allocated_by_metric
     result["remaining_by_metric"] = {metric: max(0, int(demand.get(metric, 0) or 0) - allocated_by_metric[metric])
                                      for metric in metrics}
@@ -964,8 +1051,8 @@ def _dailyize_coverage_result(team, project: dict, result: dict, leave_start: da
         for metric in metrics
     }
     if not any(int(demand.get(metric, 0) or 0) for metric in metrics):
-        result["summary"] = "마감 내 완료 가능"
-        result["confidence"] = "높음"
+        result["summary"] = "대체 분배할 잔여 업무 없음"
+        result["confidence"] = "해당 없음"
     elif team_days <= 0:
         result["summary"] = "현재 인력으로 마감 내 완료 어려움"
         result["confidence"] = "보통"

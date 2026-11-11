@@ -446,3 +446,43 @@ def recommend_daily_count(team: TeamData, member_id: int, phase: str, subsystem:
                 "basis": (f"{scope}의 최근 활동일 {len(recent)}일({recent[0][0]}~{recent[-1][0]}) "
                           f"일별 {label} 개수 중앙값 {_median(values):g}개 (범위 {min(values):g}~{max(values):g}개)")}
     return None
+
+
+def recommend_daily_median(team: TeamData, member_id: int, phase: str, metric: str,
+                           ref_date: date | None = None) -> dict | None:
+    """Return the worklog page's recent daily-median recommendation for a work metric."""
+    main_metric = "tasks" if phase == "spec" else "requirements" if phase == "verify" else None
+    if metric == main_metric:
+        return recommend_daily_count(team, member_id, phase, None, ref_date)
+    if phase != "verify" or metric != "functions":
+        raise ValueError("지원하는 업무 지표는 spec/tasks 또는 verify/requirements/functions입니다.")
+
+    ref_date = ref_date or _today()
+    rows = [r for r in _records(team) if r.get("track") == "dynamic"
+            and _text_value(r.get("source")) != "샘플"
+            and isinstance(r.get("date"), date) and r["date"] <= ref_date]
+    pool = team.unit_pool() or {member_id}
+    scopes = [
+        (f"{team.name(member_id)}님의 전체 기록", [r for r in rows if r.get("member_id") == member_id]),
+        ("단위 검증 인원 전체 기록", [r for r in rows if r.get("member_id") in pool]),
+    ]
+    for scope, scoped in scopes:
+        if scope.startswith("단위"):
+            by_member: dict = {}
+            for row in scoped:
+                by_member.setdefault(row.get("member_id"), []).append(row)
+            daily = sorted((day, total) for member_rows in by_member.values()
+                           for day, total in _daily_totals(member_rows, "func"))
+        else:
+            daily = _daily_totals(scoped, "func")
+        if len(daily) < RECOMMEND_MIN_DAYS:
+            continue
+        recent = daily[-RECOMMEND_RECENT_DAYS:]
+        values = [value for _, value in recent]
+        median = _median(values)
+        return {"value": max(int(round(median)), 1), "median": median, "label": "완료 함수",
+                "scope": scope, "days": len(recent), "low": int(min(values)), "high": int(max(values)),
+                "period": (recent[0][0], recent[-1][0]),
+                "basis": (f"{scope}의 최근 활동일 {len(recent)}일({recent[0][0]}~{recent[-1][0]}) "
+                          f"일별 완료 함수 개수 중앙값 {median:g}개 (범위 {min(values):g}~{max(values):g}개)")}
+    return None

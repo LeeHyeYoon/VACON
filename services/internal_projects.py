@@ -547,9 +547,25 @@ def _split_units(total: int, weights: dict[int, float]) -> dict[int, int]:
     return out
 
 
+def _split_units_capped(total: int, weights: dict[int, float], quotas: dict[int, int]) -> dict[int, int]:
+    """Allocate a subsystem's integer units while preserving each person's total quota."""
+    output = {mid: 0 for mid in quotas}
+    remaining = {mid: max(0, int(quota)) for mid, quota in quotas.items()}
+    for _ in range(max(0, min(int(total), sum(remaining.values())))):
+        candidates = [mid for mid, capacity in remaining.items()
+                      if capacity > 0 and float(weights.get(mid, 0) or 0) > 0]
+        if not candidates:
+            break
+        chosen = max(candidates, key=lambda mid: (float(weights[mid]) / (output[mid] + 1), -mid))
+        output[chosen] += 1
+        remaining[chosen] -= 1
+    return output
+
+
 def recommend_distribution(team, project: dict, phase: str, workloads: list[dict], today: date, path=None,
                            exclude_member_ids: set[int] | None = None,
-                           member_weight_multipliers: dict[int, float] | None = None) -> dict:
+                           member_weight_multipliers: dict[int, float] | None = None,
+                           metric_weight_overrides: dict[str, dict[int, float]] | None = None) -> dict:
     """휴가·기존 업무량·역량을 반영한 검토용 배분안. 저장은 PM 승인 후 별도 수행한다."""
     if phase not in ("spec", "verify"):
         raise ValueError("phase는 spec 또는 verify여야 합니다.")
@@ -608,6 +624,16 @@ def recommend_distribution(team, project: dict, phase: str, workloads: list[dict
     else:
         warnings.append("마감일이 없어 남은 업무 가능일을 계산할 수 없습니다.")
 
+    metric_quotas = {}
+    if metric_weight_overrides is not None:
+        metrics = ("tasks",) if phase == "spec" else ("functions", "requirements")
+        for metric in metrics:
+            total = sum(int(item.get(f"total_{metric}") or 0) for item in workloads)
+            weights = metric_weight_overrides.get(metric, {})
+            metric_quotas[metric] = (_split_units(total, weights)
+                                     if total > 0 and sum(max(0.0, float(v or 0)) for v in weights.values()) > 0
+                                     else {mid: 0 for mid in candidate_ids})
+    metric_quota_remaining = {metric: dict(quotas) for metric, quotas in metric_quotas.items()}
     assignment: dict[tuple[str, int], dict] = {}
     for item in workloads:
         subsystem = str(item["subsystem"])
@@ -629,7 +655,18 @@ def recommend_distribution(team, project: dict, phase: str, workloads: list[dict
                   [("functions", "total_functions", "completed_functions"),
                    ("requirements", "total_requirements", "completed_requirements")])
         for label, total_key, metric in fields:
-            pieces = _split_units(int(item.get(total_key) or 0), weights)
+            metric_weights = ({mid: max(0.0, float(metric_weight_overrides.get(label, {}).get(mid, 0) or 0))
+                               for mid in candidate_ids}
+                              if metric_weight_overrides is not None else weights)
+            if metric_weight_overrides is not None and sum(metric_weights.values()) <= 0:
+                pieces = {mid: 0 for mid in candidate_ids}
+            elif metric_weight_overrides is not None:
+                pieces = _split_units_capped(int(item.get(total_key) or 0), metric_weights,
+                                             metric_quota_remaining[label])
+                for mid, amount in pieces.items():
+                    metric_quota_remaining[label][mid] -= amount
+            else:
+                pieces = _split_units(int(item.get(total_key) or 0), metric_weights)
             for mid, amount in pieces.items():
                 if amount <= 0:
                     continue

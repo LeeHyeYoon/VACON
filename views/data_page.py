@@ -5,7 +5,7 @@ from data import db
 from services.models import MBTI_TYPES, isnull
 from services.validation import validate_member
 from views import sheet_tab
-from views.common import errors_box, header, show_df
+from views.common import errors_box, header, page_surface, show_df
 
 
 MBTI_OPTIONS = ["미입력", *MBTI_TYPES]
@@ -13,16 +13,17 @@ MBTI_OPTIONS = ["미입력", *MBTI_TYPES]
 
 def render(team, rules):
     header("🗂️ 데이터 관리", "팀원 정보와 시트 연동을 관리합니다.")
-    t1, t2, t3 = st.tabs(["팀원 · 자격증", "시트 연동", "초기화"])
-    with t1:
-        _members(team)
-    with t2:
-        sheet_tab.render(team, rules)
-    with t3:
-        st.warning("모든 데이터(팀원·업무·휴가·설정)를 삭제하고 샘플 데이터로 되돌립니다.")
-        if st.toggle("초기화에 동의합니다") and st.button("샘플 데이터로 초기화"):
-            db.reset_sample()
-            st.rerun()
+    with page_surface("data"):
+        t1, t2, t3 = st.tabs(["팀원 · 자격증", "시트 연동", "초기화"])
+        with t1:
+            _members(team)
+        with t2:
+            sheet_tab.render(team, rules)
+        with t3:
+            st.warning("모든 데이터(팀원·업무·휴가·설정)를 삭제하고 샘플 데이터로 되돌립니다.")
+            if st.toggle("초기화에 동의합니다") and st.button("샘플 데이터로 초기화"):
+                db.reset_sample()
+                st.rerun()
 
 
 def _members(team):

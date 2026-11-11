@@ -10,7 +10,7 @@ from services import llm
 from services.internal_projects import dashboard, is_internal_version, recommend_distribution
 from services.coverage import workflow_stage
 from services.models import today
-from views.common import header, show_df
+from views.common import header, page_surface, show_df
 
 WORKLOG_PAGE = None
 
@@ -88,6 +88,48 @@ def _edit_version_deadline_form(project):
                 st.rerun()
             except Exception as exc:
                 st.error(f"마감일을 저장하지 못했습니다: {exc}")
+
+
+def _render_delete_version(project):
+    with st.expander("PM · 버전 삭제", expanded=False):
+        impact = db.version_project_delete_impact(project["id"])
+        if not impact:
+            st.warning("선택한 버전을 찾을 수 없습니다. 새로고침 후 다시 확인하세요.")
+            return
+        st.warning(
+            f"{project['version']}을 VACON 내부 DB에서 삭제합니다. 해당 버전의 계획, 일정, 실적, "
+            "담당 배정과 변경 이력도 함께 삭제되며 되돌릴 수 없습니다. Google Sheets 원본 데이터는 변경하지 않습니다."
+        )
+        nonzero = {name: count for name, count in impact["records"].items() if count}
+        if impact["approval_settings"]:
+            nonzero["PM 승인 설정"] = impact["approval_settings"]
+        if nonzero:
+            show_df(pd.DataFrame([{"삭제 대상": name, "건수": count}
+                                  for name, count in nonzero.items()]))
+        else:
+            st.caption("함께 삭제될 세부 계획이나 실적은 없습니다.")
+        typed_version = st.text_input(
+            f"삭제를 확인하려면 버전명 {project['version']}을 입력하세요.",
+            key=f"delete_version_confirm_{project['id']}")
+        if st.button("선택 버전 영구 삭제", type="primary",
+                     disabled=typed_version.strip().casefold() != project["version"].casefold(),
+                     key=f"delete_version_button_{project['id']}"):
+            try:
+                deleted = db.delete_version_project(project["id"])
+                if deleted is None:
+                    st.error("선택한 버전이 이미 삭제되었습니다.")
+                    return
+                active = st.session_state.get("pm_approved_daily_targets", {})
+                st.session_state["pm_approved_daily_targets"] = {
+                    key: value for key, value in active.items()
+                    if int(value.get("project_id", 0)) != int(project["id"])
+                }
+                st.session_state["reset_internal_version_pick_after_delete"] = True
+                st.cache_data.clear()
+                st.success(f"{project['version']} 및 해당 버전의 VACON 계획·실적을 삭제했습니다.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"버전을 삭제하지 못했습니다: {exc}")
 
 
 def _schedule_and_workload(project, team):
@@ -410,10 +452,9 @@ def _render_recommendations(project, team, allow_approval=True):
 
 
 def _render_pm_review_flow(project, stage):
-    with st.container(border=True, key="version_pm_review_panel"):
-        st.markdown("### PM 검토 단계")
-        st.caption("요구사양서 작성 검토를 완료한 뒤 동적 검증 검토를 진행합니다.")
-        _render_pm_review_controls(project, stage)
+    st.markdown("### PM 검토 단계")
+    st.caption("요구사양서 검토를 마치면 동적 검증 검토가 순서대로 열립니다.")
+    _render_pm_review_controls(project, stage)
 
 
 def _render_pm_review_controls(project, stage):
@@ -425,11 +466,26 @@ def _render_pm_review_controls(project, stage):
     spec_status = project.get("spec_review_status", "대기")
     verify_status = project.get("verify_summary_status", "대기")
 
-    spec_col, verify_col = st.columns(2)
-    with spec_col:
-        st.write(f"**요구사양서 PM 검토:** {spec_status}")
+    st.html("""
+    <style>
+      .st-key-spec_pm_review_step,
+      .st-key-verify_pm_review_step {
+        background: #ffffff;
+        border: 1px solid #e7ebf0;
+        border-radius: 10px;
+        padding: 0.8rem 1rem;
+        margin-bottom: 0.55rem;
+      }
+    </style>
+    """)
+    with st.container(border=True, key="spec_pm_review_step"):
+        st.markdown("#### 1. 요구사양서 검토")
+        st.caption(f"PM 검토 상태: **{spec_status}**")
+        if spec_total > 0:
+            st.progress(min(1.0, spec_done / spec_total),
+                        text=f"작성 실적 {min(spec_done, spec_total)} / {spec_total}건")
         if not spec_complete:
-            st.caption(f"작성 실적이 완료되어야 검토할 수 있습니다 · {spec_done}/{spec_total}건")
+            st.caption("작성 실적을 모두 완료하면 PM 검토를 시작할 수 있습니다.")
         elif spec_status == "완료":
             st.success("요구사양서 검토가 완료됐습니다.")
         elif spec_status == "검토 중":
@@ -448,15 +504,18 @@ def _render_pm_review_controls(project, stage):
             except Exception as exc:
                 st.error(f"요구사양서 검토를 시작하지 못했습니다: {exc}")
 
-    with verify_col:
+    st.caption("↓　요구사양서 검토 완료 후 다음 단계가 열립니다")
+    with st.container(border=True, key="verify_pm_review_step"):
+        st.markdown("#### 2. 동적 검증 검토")
         verify_label = {"대기": "대기", "정리 중": "검토 중", "완료": "검토 완료"}.get(verify_status, verify_status)
-        st.write(f"**동적 검증 PM 검토:** {verify_label}")
+        st.caption(f"PM 검토 상태: **{verify_label}**")
         if spec_status != "완료":
-            st.caption("요구사양서 작성 및 PM 검토 완료 후 동적 검증 검토를 진행할 수 있습니다.")
+            st.info("요구사양서 PM 검토를 완료하면 이 단계가 활성화됩니다.")
         elif not verify_complete:
             req = verify["requirements"]
             funcs = verify["functions"]
-            st.caption(f"검증 실적 완료 후 검토할 수 있습니다 · 요구사양서 {req[1]}/{req[0]}건 · 함수 {funcs[1]}/{funcs[0]}개")
+            st.caption(f"검증 실적 현황 · 요구사양서 {req[1]}/{req[0]}건 · 함수 {funcs[1]}/{funcs[0]}개")
+            st.caption("등록된 검증 실적을 모두 완료하면 PM 검토를 시작할 수 있습니다.")
         elif verify_status == "완료":
             st.success("동적 검증 검토가 완료됐습니다.")
         elif verify_status == "정리 중":
@@ -478,73 +537,77 @@ def _render_pm_review_controls(project, stage):
 
 def render(team, rules=None):
     header("🗓️ (PM) 검증 일정 관리", "PM이 버전별 요구사양서 작성·동적 검증 목표와 마감일을 관리합니다. 실제 기록은 검증 업무 기록에서 입력합니다.")
-    projects = [p for p in db.list_version_projects() if is_internal_version(p["version"])]
-    by_id = {int(p["id"]): p for p in projects}
-    created_project_id = st.session_state.pop("internal_version_pick_after_create", None)
-    if created_project_id in by_id:
-        st.session_state["internal_version_pick"] = created_project_id
-    new_version_option = "새 버전 및 마감일 등록"
-    selected_id = st.selectbox("버전", [new_version_option, *by_id],
-                               format_func=lambda value: new_version_option if value == new_version_option else by_id[value]["version"],
-                               key="internal_version_pick")
-    if selected_id == new_version_option:
-        _new_version_deadline_form()
-        return
-    project = db.get_version_project(selected_id)
-    stage = workflow_stage(project)
-    st.html("""
-    <style>
-      .st-key-version_progress_panel,
-      .st-key-version_progress_panel > div,
-      .st-key-version_deadline_panel,
-      .st-key-version_deadline_panel > div,
-      .st-key-version_pm_review_panel,
-      .st-key-version_pm_review_panel > div {
-        background-color: #ffffff !important;
-      }
-      .st-key-version_progress_panel,
-      .st-key-version_deadline_panel,
-      .st-key-version_pm_review_panel {
-        border: 1px solid #e7ebf0;
-        border-radius: 12px;
-        padding: 0.8rem 1rem;
-      }
-    </style>
-    """)
-    with st.container(border=True, key="version_progress_panel"):
-        st.markdown("### 업무 진행 현황")
-        st.info(stage["message"])
-        spec_total, spec_done = stage["spec"]
-        verify_requirements = stage["verify"]["requirements"]
-        verify_functions = stage["verify"]["functions"]
-        step_cols = st.columns(3)
-        step_cols[0].metric("요구사양서 작성", f"{min(spec_done, spec_total)} / {spec_total}" if spec_total else "계획 미등록")
-        step_cols[1].metric("동적 검증 대상 요구사양서", verify_requirements[0])
-        step_cols[2].metric("동적 검증 대상 함수", verify_functions[0])
-        st.caption(f"요구사양서 작성 전체 일감: {project['spec_total_items']} · 동적 검증 등록 전체 요구사양서: {project['verify_spec_total_items']}")
-        split_history = [h for h in db.version_project_history(project["id"])
-                         if h["field"] == "verify_spec_total_items" and str(h.get("new_value", "")).startswith("0 — 기존 공용값 분리")]
-        if split_history:
-            st.info("이전 화면에서 공용으로 쓰던 동적 검증 사양서 수는 변경 이력에 보관했습니다. 실제 동적 검증 목표 수를 별도 입력하세요.")
-    _edit_version_deadline_form(project)
-    _render_pm_review_flow(project, stage)
-    if WORKLOG_PAGE is not None:
-        def open_worklog(version):
-            st.session_state["worklog_version"] = version
-            st.switch_page(WORKLOG_PAGE)
-        st.button("선택 버전의 전체 업무 로그 보기 →", key=f"internal_worklog_link_{selected_id}",
-                  on_click=open_worklog, args=(project["version"],))
-    with st.container(key="planning_area_shell"):
-        st.markdown("## 일정 관리 영역")
-        st.caption("일정과 사전 물량을 관리하거나, 업무 단계별 진척 내용을 확인합니다.")
-        planning_view = st.segmented_control(
-            "일정 관리 영역", ["일정 및 사전 물량", "요구사양서 작성", "동적 검증"],
-            selection_mode="single", default="일정 및 사전 물량",
-            key=f"planning_view_{selected_id}", width="stretch",
-            label_visibility="collapsed") or "일정 및 사전 물량"
-        if planning_view == "일정 및 사전 물량":
-            _schedule_and_workload(project, team)
-        elif planning_view == "요구사양서 작성":
-            _render_phase(project, team, "spec")
-        else:
-            _render_phase(project, team, "verify")
+    with page_surface("pm_schedule"):
+        projects = [p for p in db.list_version_projects() if is_internal_version(p["version"])]
+        by_id = {int(p["id"]): p for p in projects}
+        if st.session_state.pop("reset_internal_version_pick_after_delete", False):
+            st.session_state.pop("internal_version_pick", None)
+        created_project_id = st.session_state.pop("internal_version_pick_after_create", None)
+        if created_project_id in by_id:
+            st.session_state["internal_version_pick"] = created_project_id
+        new_version_option = "새 버전 및 마감일 등록"
+        selected_id = st.selectbox("버전", [new_version_option, *by_id],
+                                   format_func=lambda value: new_version_option if value == new_version_option else by_id[value]["version"],
+                                   key="internal_version_pick")
+        if selected_id == new_version_option:
+            _new_version_deadline_form()
+            return
+        project = db.get_version_project(selected_id)
+        stage = workflow_stage(project)
+        st.html("""
+        <style>
+          .st-key-version_progress_panel,
+          .st-key-version_progress_panel > div,
+          .st-key-version_deadline_panel,
+          .st-key-version_deadline_panel > div,
+          .st-key-version_pm_review_panel,
+          .st-key-version_pm_review_panel > div {
+            background-color: #ffffff !important;
+          }
+          .st-key-version_progress_panel,
+          .st-key-version_deadline_panel,
+          .st-key-version_pm_review_panel {
+            border: 1px solid #e7ebf0;
+            border-radius: 12px;
+            padding: 0.8rem 1rem;
+          }
+        </style>
+        """)
+        with st.container(border=True, key="version_progress_panel"):
+            st.markdown("### 업무 진행 현황")
+            st.info(stage["message"])
+            spec_total, spec_done = stage["spec"]
+            verify_requirements = stage["verify"]["requirements"]
+            verify_functions = stage["verify"]["functions"]
+            step_cols = st.columns(3)
+            step_cols[0].metric("요구사양서 작성", f"{min(spec_done, spec_total)} / {spec_total}" if spec_total else "계획 미등록")
+            step_cols[1].metric("동적 검증 대상 요구사양서", verify_requirements[0])
+            step_cols[2].metric("동적 검증 대상 함수", verify_functions[0])
+            st.caption(f"요구사양서 작성 전체 일감: {project['spec_total_items']} · 동적 검증 등록 전체 요구사양서: {project['verify_spec_total_items']}")
+            split_history = [h for h in db.version_project_history(project["id"])
+                             if h["field"] == "verify_spec_total_items" and str(h.get("new_value", "")).startswith("0 — 기존 공용값 분리")]
+            if split_history:
+                st.info("이전 화면에서 공용으로 쓰던 동적 검증 사양서 수는 변경 이력에 보관했습니다. 실제 동적 검증 목표 수를 별도 입력하세요.")
+        _edit_version_deadline_form(project)
+        _render_pm_review_flow(project, stage)
+        if WORKLOG_PAGE is not None:
+            def open_worklog(version):
+                st.session_state["worklog_version"] = version
+                st.switch_page(WORKLOG_PAGE)
+            st.button("선택 버전의 전체 업무 로그 보기 →", key=f"internal_worklog_link_{selected_id}",
+                      on_click=open_worklog, args=(project["version"],))
+        with st.container(key="planning_area_shell"):
+            st.markdown("## 일정 관리 영역")
+            st.caption("일정과 사전 물량을 관리하거나, 업무 단계별 진척 내용을 확인합니다.")
+            planning_view = st.segmented_control(
+                "일정 관리 영역", ["일정 및 사전 물량", "요구사양서 작성", "동적 검증"],
+                selection_mode="single", default="일정 및 사전 물량",
+                key=f"planning_view_{selected_id}", width="stretch",
+                label_visibility="collapsed") or "일정 및 사전 물량"
+            if planning_view == "일정 및 사전 물량":
+                _schedule_and_workload(project, team)
+            elif planning_view == "요구사양서 작성":
+                _render_phase(project, team, "spec")
+            else:
+                _render_phase(project, team, "verify")
+        _render_delete_version(project)
